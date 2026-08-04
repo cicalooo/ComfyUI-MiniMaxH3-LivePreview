@@ -1,0 +1,154 @@
+.mmh3-root {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+    min-height: 160px;
+    box-sizing: border-box;
+    background: #1a1a1a;
+    border: 1px solid #2f2f2f;
+    border-radius: 6px;
+    overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #d8d8d8;
+}
+
+.mmh3-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    padding: 3px 6px;
+    background: #232323;
+    border-bottom: 1px solid #2f2f2f;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #8a8a8a;
+    user-select: none;
+}
+
+.mmh3-title {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mmh3-tabs {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 2px;
+}
+
+.mmh3-tab {
+    padding: 1px 7px;
+    border-radius: 3px;
+    background: #2c2c2c;
+    color: #7a7a7a;
+    cursor: pointer;
+    font-size: 9px;
+}
+
+.mmh3-tab:hover {
+    color: #c8c8c8;
+}
+
+.mmh3-tab.active {
+    background: #3d6ea8;
+    color: #f0f0f0;
+}
+
+.mmh3-tab.disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
+.mmh3-tab.disabled:hover {
+    color: #7a7a7a;
+}
+
+.mmh3-stage {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 60px;
+    background: #101010;
+    overflow: hidden;
+}
+
+.mmh3-media {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    opacity: 0;
+    transition: opacity 60ms linear;
+    pointer-events: none;
+}
+
+/* Latent-resolution frames are ~84x48; smoothing them into mush helps nobody. */
+.mmh3-root[data-crisp="1"] .mmh3-media {
+    image-rendering: pixelated;
+}
+
+.mmh3-placeholder {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #565656;
+    font-size: 11px;
+    pointer-events: none;
+}
+
+.mmh3-progress {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.mmh3-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: #3d6ea8;
+    transition: width 120ms linear;
+}
+
+.mmh3-footer {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    padding: 3px 6px;
+    background: #202020;
+    border-top: 1px solid #2f2f2f;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: #9a9a9a;
+    white-space: nowrap;
+    overflow: hidden;
+    user-select: none;
+}
+
+.mmh3-footer .mmh3-spacer {
+    flex: 1 1 auto;
+}
+
+.mmh3-badge {
+    padding: 0 5px;
+    border-radius: 3px;
+    background: #2c2c2c;
+    color: #6f6f6f;
+    font-size: 9px;
+    letter-spacing: 0.05em;
+}
+
+.mmh3-badge[data-source="vae"] {
+    background: #3f5c2c;
+    color: #cde8b4;
+}

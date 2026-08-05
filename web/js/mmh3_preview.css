@@ -148,6 +148,11 @@
     letter-spacing: 0.05em;
 }
 
+.mmh3-badge[data-source="tae"] {
+    background: #2c4a5c;
+    color: #b4d9e8;
+}
+
 .mmh3-badge[data-source="vae"] {
     background: #3f5c2c;
     color: #cde8b4;

@@ -1,14 +1,18 @@
 // MiniMax H3 Live Preview -- on-node preview panel fed by the "minimax_h3_preview" event.
 //
-// Two independent streams share one stage: "latent" (cheap latent2rgb, arrives every few
-// steps) and "vae" (rare, expensive, full resolution). Each keeps its own last frame so the
-// header tabs switch between them instantly.
+// Three independent streams share one stage: "latent" (cheap latent2rgb) and "tae" (taeh3
+// tiny VAE, full resolution) are the two forms the every-few-steps stream can take, and
+// "vae" (rare, expensive, full resolution) is the real video VAE. Each keeps its own last
+// frame so the header tabs switch between them instantly.
 
 const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 const NODE_ID = "MiniMaxH3LivePreview";
 const EVENT = "minimax_h3_preview";
+// Ordered cheapest-to-truest. A stream only ever auto-steals the stage from a lower rank,
+// so a rare VAE frame surfaces itself but the latent stream never steals it back.
+const SOURCES = ["latent", "tae", "vae"];
 const STYLE_ID = "mmh3-preview-stylesheet";
 const CSS_URL = new URL("./mmh3_preview.css", import.meta.url).href;
 
@@ -161,15 +165,19 @@ app.registerExtension({
             const title = el("span", "mmh3-title", header);
             title.textContent = "MiniMax H3 Live Preview";
             const tabs = el("div", "mmh3-tabs", header);
-            const tabLatent = el("div", "mmh3-tab active", tabs);
-            tabLatent.textContent = "latent";
-            const tabVae = el("div", "mmh3-tab disabled", tabs);
-            tabVae.textContent = "vae";
+            const tabEls = {};
+            for (const s of SOURCES) {
+                // Only "latent" is available before anything has arrived; the others are the
+                // opt-in streams and unlock as soon as they produce a frame.
+                tabEls[s] = el("div", `mmh3-tab ${s === "latent" ? "active" : "disabled"}`, tabs);
+                tabEls[s].textContent = s;
+            }
 
             const stage = el("div", "mmh3-stage", root);
             const placeholder = el("div", "mmh3-placeholder", stage);
             placeholder.textContent = "waiting for sampler…";
-            const slots = { latent: createSlot(stage), vae: createSlot(stage) };
+            const slots = {};
+            for (const s of SOURCES) slots[s] = createSlot(stage);
             const progress = el("div", "mmh3-progress", stage);
             const progressFill = el("div", "mmh3-progress-fill", progress);
 
@@ -184,24 +192,31 @@ app.registerExtension({
             badge.textContent = "—";
 
             let current = "latent";
-            let hasVae = false;
+            const available = { latent: true, tae: false, vae: false };
             let userPinned = false;   // user clicked a tab: stop auto-switching
 
             function select(which) {
-                if (which === "vae" && !hasVae) return;
+                if (!available[which]) return;
                 current = which;
-                slots.latent.setActive(which === "latent");
-                slots.vae.setActive(which === "vae");
-                tabLatent.classList.toggle("active", which === "latent");
-                tabVae.classList.toggle("active", which === "vae");
-                // Only the latent stream is block-scaled; VAE frames are true resolution.
+                for (const s of SOURCES) {
+                    slots[s].setActive(s === which);
+                    tabEls[s].classList.toggle("active", s === which);
+                }
+                // Only the latent stream is block-scaled; TAE and VAE frames are true resolution.
                 root.dataset.crisp = which === "latent" ? "1" : "0";
                 badge.dataset.source = which;
-                badge.textContent = which === "vae" ? "VAE" : "LATENT";
+                badge.textContent = which.toUpperCase();
             }
 
-            tabLatent.addEventListener("click", () => { userPinned = true; select("latent"); });
-            tabVae.addEventListener("click", () => { userPinned = true; select("vae"); });
+            for (const s of SOURCES) {
+                // Clicking a stream that has produced nothing yet is a no-op, not a pin --
+                // otherwise it would silently disable auto-switching.
+                tabEls[s].addEventListener("click", () => {
+                    if (!available[s]) return;
+                    userPinned = true;
+                    select(s);
+                });
+            }
 
             node._mmh3Handler = (data) => {
                 if (Number.isFinite(data.total) && data.total > 0 && Number.isFinite(data.step)) {
@@ -218,22 +233,23 @@ app.registerExtension({
                 if (data.w && data.h) sizeEl.textContent = `${data.w}×${data.h}`;
 
                 if (!data.image) return;
-                const source = data.source === "vae" ? "vae" : "latent";
-                if (source === "vae" && !hasVae) {
-                    hasVae = true;
-                    tabVae.classList.remove("disabled");
+                const source = SOURCES.includes(data.source) ? data.source : "latent";
+                if (!available[source]) {
+                    available[source] = true;
+                    tabEls[source].classList.remove("disabled");
                 }
                 slots[source].update(data.image, data.mime || "image/jpeg").then(() => {
                     placeholder.style.display = "none";
-                    // A full-res frame is expensive and rare -- surface it once, then leave
-                    // the choice to the user. Frames for the inactive slot stay hidden.
-                    if (source === "vae" && !userPinned) select("vae");
+                    // A truer frame is the more interesting one -- surface it once, then leave
+                    // the choice to the user. Frames for inactive slots stay hidden.
+                    if (!userPinned && SOURCES.indexOf(source) > SOURCES.indexOf(current)) {
+                        select(source);
+                    }
                 }).catch(() => {});
             };
 
             chainCallback(node, "onRemoved", function () {
-                slots.latent.dispose();
-                slots.vae.dispose();
+                for (const s of SOURCES) slots[s].dispose();
                 delete node._mmh3Handler;
             });
 

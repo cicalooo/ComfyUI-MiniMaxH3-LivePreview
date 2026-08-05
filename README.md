@@ -27,9 +27,41 @@ This node handles both, keeps the video stream and discards the audio stream.
 
 ## What you actually see
 
-Frames come from the latent2rgb approximation (`MiniMaxH3Video.latent_rgb_factors`), which is free —
-a single matmul, no VAE, no VRAM. The catch is that a latent2rgb preview is inherently at **latent
-resolution**:
+Two cheap sources, pick one with `tae_decoder`:
+
+- **`none`** (default) — latent2rgb (`MiniMaxH3Video.latent_rgb_factors`): a single matmul, no VAE,
+  no VRAM, latent resolution.
+- **`taeh3.safetensors`** — the tiny VAE below: ~10 MB, full resolution, still cheap enough to run
+  every step. Recommended.
+
+### taeh3 — the tiny VAE (recommended)
+
+[Kijai/MiniMax-H3-TAE](https://huggingface.co/Kijai/MiniMax-H3-TAE) is a quickly-trained 2D tiny VAE
+decoder for H3. Download `vae_approx/taeh3.safetensors` into **`ComfyUI/models/vae_approx/`** and
+select it in the node's `tae_decoder` widget.
+
+> **Do not load it with `VAELoader`.** It fails with
+> `WARNING: No VAE weights detected, VAE not initalized.` followed by
+> `RuntimeError: ERROR: VAE is invalid: None`. Core ComfyUI recognises TAE checkpoints only by
+> `taesd_decoder.1.weight` (2D TAESD) or `decoder.22.bias` (TAEHV); taeh3 is a *bare* decoder keyed
+> by plain module indices. And even with the prefix fixed, `comfy.taesd.taesd.Decoder` hardcodes a
+> 64-wide stack with three upsample stages, while taeh3 is 24 latent channels, 96 wide for its first
+> half, and four upsample stages (H3's VAE is 16× spatial, not 8×). `tiny_vae.py` in this repo
+> rebuilds the architecture from the checkpoint's own keys instead.
+
+Being 2D, it decodes each latent frame independently — the 4× temporal compression is not undone, so
+37 latent frames still give 37 preview frames, at 1344 × 768 each. It runs on the sampler thread
+(`vae_device()`, so `--cpu-vae` is honoured) and its weights are released when the run ends.
+
+Measured on a 3090 at 1344 × 768, fp16: **8 frames in 0.25 s, ~640 MB peak VRAM**. Frames are
+decoded one at a time and moved to the CPU as they land, so that peak is per-frame — `preview_frames`
+buys time, not memory. 640 MB alongside a 21 GB transformer is the one real risk: if a decode raises
+(OOM being the plausible one) the node logs once and falls back to latent2rgb for the rest of that
+run, rather than taking sampling down with it.
+
+### latent2rgb resolution
+
+A latent2rgb preview is inherently at **latent resolution**:
 
 | generation | preview frame |
 |---|---|
@@ -56,6 +88,7 @@ samples evenly across all of them, so the preview is the whole clip, not just th
 | `vae_decode_every_n_steps` | 0 | `0` = off. See the warning below |
 | `vae_decode_frames` | 1 | full-res frames per VAE preview |
 | `vae_decode_device` | `auto` | `auto` / `gpu` / `cpu` |
+| `tae_decoder` | `none` | tiny VAE from `models/vae_approx` — `taeh3.safetensors` replaces latent2rgb with real full-resolution frames |
 
 Animated previews are sent as H.264 via NVENC when PyAV exposes it, and as animated WebP otherwise.
 NVENC refuses inputs below 145 × 49, so at `max_resolution=0` the WebP path is the normal one.
@@ -65,7 +98,8 @@ completely untouched.
 
 ## The `vae` option, and its real cost
 
-Read this before turning it on.
+Read this before turning it on. With `taeh3` available, this option is mostly obsolete — it exists
+for when you want the model's *actual* decoder rather than an approximation of it.
 
 The H3 video VAE is **~5.2 GB**. An H3 transformer is **~21 GB**. On a 24 GB card they do not
 co-fit, so:
@@ -86,9 +120,9 @@ Each frame is decoded as an independent single-latent-frame slice, which hits
 `MiniMaxH3VideoVAE`'s `_adaptive_decode` branch and keeps activations to a few hundred MB — the
 weights are the entire problem.
 
-Latent previews keep flowing normally while a VAE decode runs. The node's header has `latent` /
-`vae` tabs; each keeps its own last frame, and the panel switches to `vae` by itself the first time
-a full-resolution frame lands, then leaves the choice to you.
+Cheap previews keep flowing normally while a VAE decode runs. The node's header has `latent` / `tae`
+/ `vae` tabs; each keeps its own last frame, and the panel switches to the truer stream by itself the
+first time one lands, then leaves the choice to you.
 
 ## Requirements
 

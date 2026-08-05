@@ -32,6 +32,9 @@ import comfy.utils
 import latent_preview
 from comfy_api.latest import io
 
+from .tiny_vae import NONE as TAE_NONE
+from .tiny_vae import list_tae_decoders, load_tae_decoder
+
 try:
     from server import PromptServer
 except ImportError:
@@ -281,6 +284,19 @@ def _latent_to_pil(video, latent_format, max_frames):
         return []
 
 
+def _tae_to_pil(video, tae, max_frames):
+    """[B, 24, T, h, w] -> list of PIL frames at *full* resolution (16x the latent grid).
+
+    Raises on failure so the caller can fall back to latent2rgb for the rest of the run.
+    """
+    if video is None or video.ndim != 5:
+        return []
+    idx = _pick_indices(video.shape[2], max_frames)
+    rgb = tae.decode_video(video[:1], idx)              # [T, H, W, 3] in 0..1, on the cpu
+    u8 = rgb.mul_(255.0).clamp_(0, 255).to(torch.uint8).numpy()
+    return [Image.fromarray(u8[i]) for i in range(u8.shape[0])]
+
+
 # --------------------------------------------------------------------------------------
 # optional true-VAE decode
 # --------------------------------------------------------------------------------------
@@ -401,9 +417,10 @@ def _suppressed_preview_image(self_, preview_format, x0):
 
 class _H3PreviewWrapper:
     def __init__(self, node_id, preview_frames, preview_fps, max_resolution, every_n_steps,
-                 upscale_method, jpeg_quality, suppress_default,
+                 upscale_method, jpeg_quality, suppress_default, tae_decoder=TAE_NONE,
                  vae=None, vae_every_n_steps=0, vae_frames=1, vae_device="auto"):
         self.node_id = str(node_id) if node_id is not None else None
+        self.tae_decoder = tae_decoder
         self.preview_frames = max(1, preview_frames)
         self.preview_fps = max(1, preview_fps)
         self.max_resolution = max_resolution
@@ -465,6 +482,29 @@ class _H3PreviewWrapper:
         sigmas_list = sigmas.detach().cpu().tolist() if sigmas is not None else []
         total_steps_init = max(0, len(sigmas_list) - 1)
 
+        # Held locally, never on self: the wrapper outlives the run (it rides on the model
+        # patcher), and a cached decoder would keep its weights on the GPU forever.
+        cheap = {"tae": load_tae_decoder(self.tae_decoder)}
+
+        def _cheap_frames(video):
+            """-> (frames, source). The tiny VAE when one is loaded, latent2rgb otherwise.
+
+            Runs on the sampler thread like latent2rgb does: taeh3 is ~10 MB and a few
+            milliseconds per frame, and decoding here keeps it off the encoder thread,
+            which would otherwise allocate VRAM concurrently with a forward pass.
+            """
+            tae = cheap["tae"]
+            if tae is not None:
+                try:
+                    return _tae_to_pil(video, tae, self.preview_frames), "tae"
+                except Exception as e:
+                    cheap["tae"] = None
+                    logging.warning(
+                        f"[MiniMaxH3Preview] tiny-VAE decode failed ({e}); falling back to "
+                        "latent2rgb for the rest of this run."
+                    )
+            return _latent_to_pil(video, latent_format, self.preview_frames), "latent"
+
         encoder = _Worker("mmh3_preview_encode", maxsize=2)
         vae_worker = None
         vae_decoder = None
@@ -481,8 +521,8 @@ class _H3PreviewWrapper:
             if sigmas is not None and len(sigmas) > 0:
                 s0 = sigmas[0].to(noise.device)
                 video0 = comfy.utils.unpack_latents(noise * s0, latent_shapes)[0]
-                p = self._frames_to_payload(
-                    _latent_to_pil(video0, latent_format, self.preview_frames), "latent")
+                frames0, source0 = _cheap_frames(video0)
+                p = self._frames_to_payload(frames0, source0)
                 if p:
                     init.update(p)
         except Exception as e:
@@ -509,18 +549,19 @@ class _H3PreviewWrapper:
                     avg_ms = (sum(state["window"]) / len(state["window"])) if state["window"] else None
                     sigma_val = sigmas_list[step] if 0 <= step < len(sigmas_list) else None
 
-                    frames = _latent_to_pil(video, latent_format, self.preview_frames)
+                    frames, source = _cheap_frames(video)
                     if frames:
-                        def _send_latent(frames=frames, step_ms=step_ms, avg_ms=avg_ms,
-                                         sigma_val=sigma_val, sent=step + 1, total=total_steps):
-                            p = self._frames_to_payload(frames, "latent")
+                        def _send_cheap(frames=frames, source=source, step_ms=step_ms,
+                                        avg_ms=avg_ms, sigma_val=sigma_val,
+                                        sent=step + 1, total=total_steps):
+                            p = self._frames_to_payload(frames, source)
                             if p:
                                 p.update({"step": sent, "total": total, "sigma": sigma_val,
                                           "step_ms": step_ms, "avg_step_ms": avg_ms})
                                 self._send(p)
                         # The last frame is what the panel is left displaying, so wait for
                         # a queue slot rather than dropping it. Sampling is over anyway.
-                        encoder.submit(_send_latent, block_timeout=5.0 if is_last else None)
+                        encoder.submit(_send_cheap, block_timeout=5.0 if is_last else None)
 
                     if vae_decoder is not None and (step % self.vae_every_n_steps == 0 or is_last):
                         device = vae_decoder.resolve(video)
@@ -583,6 +624,9 @@ class _H3PreviewWrapper:
                 vae_worker.shutdown(drain_timeout=2.0)
             elif vae_decoder is not None:
                 vae_decoder.restore()
+            # After the encoder has drained: a queued job holds only PIL frames, but the
+            # decoder's weights should not outlive the run.
+            cheap["tae"] = None
             for cls, prev in prev_methods:
                 cls.decode_latent_to_preview_image = prev
 
@@ -600,18 +644,22 @@ class MiniMaxH3LivePreview(io.ComfyNode):
             category="model/patch/minimax",
             description=(
                 "Drop between the H3 model loader and the sampler to watch the video build up "
-                "on this node's own panel, mid-generation. Frames come from the latent2rgb "
-                "approximation, so preview resolution is the latent resolution (width/16 x "
-                "height/16) upscaled for display -- enough to read composition and motion. "
-                "Wire the H3 video VAE and set vae_decode_every_n_steps for occasional "
-                "full-resolution frames (see the tooltip for the cost)."
+                "on this node's own panel, mid-generation. By default frames come from the "
+                "latent2rgb approximation, so preview resolution is the latent resolution "
+                "(width/16 x height/16) upscaled for display -- enough to read composition and "
+                "motion. Set tae_decoder to taeh3.safetensors (in models/vae_approx) for real "
+                "decoded frames at full resolution, still cheap enough for every step. Wiring "
+                "the H3 video VAE and setting vae_decode_every_n_steps is the expensive option "
+                "(see that tooltip for the cost)."
             ),
             inputs=[
                 io.Model.Input("model", tooltip="MiniMax H3 model. Non-H3 models pass through untouched."),
                 io.Int.Input(
                     "preview_frames", default=8, min=1, max=256, step=1,
                     tooltip="Latent frames sampled evenly across the clip for each preview. "
-                            "1 = a single still image; >1 = animated playback.",
+                            "1 = a single still image; >1 = animated playback. Free with "
+                            "latent2rgb; with tae_decoder each frame is a real decode, so lower "
+                            "this if previews start costing sampler time.",
                 ),
                 io.Int.Input(
                     "preview_fps", default=8, min=1, max=60, step=1,
@@ -619,9 +667,10 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "max_resolution", default=512, min=0, max=4096, step=8,
-                    tooltip="Longest side of the transmitted preview, in pixels. Latent frames are "
-                            "tiny (84x48 for a 1344x768 generation), so this mostly upscales. "
-                            "0 = send at native latent resolution.",
+                    tooltip="Longest side of the transmitted preview, in pixels. Latent2rgb frames "
+                            "are tiny (84x48 for a 1344x768 generation) so this mostly upscales; "
+                            "tae_decoder frames are full resolution, so it downscales them for "
+                            "transport. 0 = send at native resolution.",
                 ),
                 io.Int.Input(
                     "every_n_steps", default=1, min=1, max=100, step=1,
@@ -665,6 +714,20 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                     tooltip="auto compares free VRAM against the VAE's weights plus decode "
                             "activations and picks cpu when they do not fit, logging the numbers.",
                 ),
+                # Appended rather than grouped with the other preview widgets so existing
+                # workflows keep their widget values lined up.
+                io.Combo.Input(
+                    "tae_decoder", options=list_tae_decoders(), default=TAE_NONE,
+                    tooltip="Tiny VAE decoder from models/vae_approx, replacing the "
+                            "latent-resolution latent2rgb preview with real decoded frames at "
+                            "full resolution. taeh3.safetensors "
+                            "(huggingface.co/Kijai/MiniMax-H3-TAE) is ~10 MB and decodes each "
+                            "latent frame in 2D -- 8 frames at 1344x768 in 0.25s and ~640 MB peak "
+                            "on a 3090, nothing like the 5.2 GB video VAE above. A failed decode "
+                            "(OOM on a full card) falls back to latent2rgb. none = latent2rgb. "
+                            "Put the file in models/vae_approx and select it here: VAELoader "
+                            "cannot load it ('VAE is invalid: None').",
+                ),
             ],
             outputs=[io.Model.Output(tooltip="Model with the live preview attached.")],
             hidden=[io.Hidden.unique_id],
@@ -675,7 +738,7 @@ class MiniMaxH3LivePreview(io.ComfyNode):
     def execute(cls, model, preview_frames, preview_fps, max_resolution, every_n_steps,
                 upscale_method, jpeg_quality, suppress_default_preview,
                 vae=None, vae_decode_every_n_steps=0, vae_decode_frames=1,
-                vae_decode_device="auto") -> io.NodeOutput:
+                vae_decode_device="auto", tae_decoder=TAE_NONE) -> io.NodeOutput:
         if vae_decode_every_n_steps > 0:
             if vae is None:
                 logging.warning(
@@ -697,7 +760,8 @@ class MiniMaxH3LivePreview(io.ComfyNode):
             _H3PreviewWrapper(
                 cls.hidden.unique_id, preview_frames, preview_fps, max_resolution,
                 every_n_steps, upscale_method, jpeg_quality, suppress_default_preview,
-                vae, vae_decode_every_n_steps, vae_decode_frames, vae_decode_device,
+                tae_decoder, vae, vae_decode_every_n_steps, vae_decode_frames,
+                vae_decode_device,
             ),
         )
         return io.NodeOutput(m)

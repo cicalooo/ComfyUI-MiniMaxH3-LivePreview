@@ -1,4 +1,4 @@
-# ComfyUI-MiniMaxH3-Preview
+# ComfyUI-MiniMaxH3-LivePreview
 
 A single MODEL-patch node — **MiniMax H3 Live Preview** — that shows the video building up on its
 own node body while H3 samples. Drop it between the H3 model loader and the sampler; nothing else
@@ -127,16 +127,40 @@ Cheap previews keep flowing normally while a VAE decode runs. The node's header 
 / `vae` tabs; each keeps its own last frame, and the panel switches to the truer stream by itself the
 first time one lands, then leaves the choice to you.
 
+## Install
+
+1. Clone into `ComfyUI/custom_nodes/ComfyUI-MiniMaxH3-LivePreview`
+2. Restart ComfyUI
+3. Download [`taeh3.safetensors`](https://huggingface.co/Kijai/MiniMax-H3-TAE) into `ComfyUI/models/vae_approx/`
+4. Drop **MiniMax H3 Live Preview** between the H3 model loader and the sampler, then select `taeh3.safetensors`
+
 ## Requirements
 
 ComfyUI with MiniMax H3 support (`comfy/ldm/minimax/`), Pillow, and PyAV. Tested against
-`comfyui-frontend-package==1.47.12` on Windows / RTX 3090.
+`comfyui-frontend-package==1.51.9` on Windows / RTX 3090.
 
+## Verification
+
+Offline hardening checks (no live server required), from the ComfyUI root:
+
+```bat
+set PYTHONPATH=%CD%;%CD%\custom_nodes
+python custom_nodes\ComfyUI-MiniMaxH3-LivePreview\scripts\offline_verify.py
+```
+
+Live TAE/latent websocket acceptance (ComfyUI must be running):
+
+```bat
+python custom_nodes\ComfyUI-MiniMaxH3-LivePreview\scripts\live_accept_preview.py
+```
+
+Accepted scope is **TAE + latent2rgb**. Full video-VAE live preview is a niche optional path and
+not part of normal acceptance.
 
 ## Audit notes / remaining host limitations
 
-The plugin has been hardened against the issues found in the installed ComfyUI checkout. The
-following items are intentionally **not** changed here because they belong to ComfyUI core or
+Hardening details are in [`docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md`](docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md).
+The following items are intentionally **not** changed here because they belong to ComfyUI core or
 the separate H3 loader/VAE implementation:
 
 - **Core `NestedTensor` callback contract:** the sampler still packs AV latents and reconstructs
@@ -156,16 +180,3 @@ the separate H3 loader/VAE implementation:
 - **Frontend lifecycle/version compatibility:** the node uses the current `window.comfyAPI`
   extension API. If an older frontend omits that API or changes qualified execution IDs, the
   frontend must be adapted to that host version.
-
-These are follow-up items for later rather than silently ignored risks.
-
-For a no-server regression check of the plugin-side hardening, run:
-
-```bat
-set PYTHONPATH=C:\comfycli;C:\comfycli\custom_nodes
-python custom_nodes\ComfyUI-MiniMaxH3-LivePreview\_offline_verify.py
-```
-
-from the ComfyUI root. Live TAE/latent acceptance can be re-checked with
-`_live_accept_preview.py` while ComfyUI is running. Full video-VAE preview acceptance is out of
-scope.

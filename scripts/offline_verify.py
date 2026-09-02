@@ -1,7 +1,7 @@
 """Offline verification for MiniMax H3 Live Preview hardening.
 
 Runs without a live ComfyUI server. Intended for local acceptance of the
-plugin-side fixes documented in MINIMAX_H3_LIVE_PREVIEW_AUDIT.md.
+plugin-side fixes documented in docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md.
 """
 
 from __future__ import annotations
@@ -21,12 +21,13 @@ import torch
 from PIL import Image
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 COMFY = ROOT.parents[1]
+CUSTOM_NODES = ROOT.parent
 if str(COMFY) not in sys.path:
     sys.path.insert(0, str(COMFY))
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+if str(CUSTOM_NODES) not in sys.path:
+    sys.path.insert(0, str(CUSTOM_NODES))
 
 
 def _ok(name: str) -> None:

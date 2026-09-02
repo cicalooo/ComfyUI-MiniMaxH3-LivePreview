@@ -161,7 +161,7 @@ The widget now declares:
 Added an audit-notes section listing host/core limitations that were intentionally not changed in
 this plugin.
 
-### `MINIMAX_H3_LIVE_PREVIEW_AUDIT.md`
+### `docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md`
 
 This report.
 
@@ -237,8 +237,8 @@ Follow-up work after the initial audit report:
 
 ### Offline verification harness
 
-Added `_offline_verify.py`, which exercises the plugin-side fixes without requiring a live ComfyUI
-server:
+Added `scripts/offline_verify.py`, which exercises the plugin-side fixes without requiring a live
+ComfyUI server:
 
 - package import and V3 schema generation
 - legacy/cached input bounding
@@ -262,8 +262,8 @@ ComfyUI was later available at `http://127.0.0.1:8188` (version `0.34.0`, RTX 30
 `cli-anything-comfyui` CLI app became usable, and a minimal API-format H3 prompt was queued with
 `MiniMaxH3LivePreview` inserted between `UNETLoader` and `MiniMaxH3SigmaShift`.
 
-Harness: `_live_accept_preview.py` (captures `minimax_h3_preview` websocket events for the same
-`client_id` used to queue the prompt).
+Harness: `scripts/live_accept_preview.py` (captures `minimax_h3_preview` websocket events for the
+same `client_id` used to queue the prompt).
 
 #### Passed live checks
 

@@ -15,7 +15,7 @@ import websocket  # websocket-client
 BASE = "http://127.0.0.1:8188"
 WS_BASE = "ws://127.0.0.1:8188/ws"
 EVENT = "minimax_h3_preview"
-OUT = Path(__file__).with_name("_live_accept_preview_report.json")
+OUT = Path(__file__).with_name("live_accept_preview_report.json")
 
 
 def build_prompt(

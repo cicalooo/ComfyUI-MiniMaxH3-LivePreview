@@ -1,7 +1,13 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*.egg-info/
 .DS_Store
+Thumbs.db
 .pytest_cache/
 .ruff_cache/
-_live_accept_preview_report.json
+.mypy_cache/
+.idea/
+.vscode/
+*.log
+scripts/live_accept_preview_report.json

@@ -59,7 +59,12 @@ function findNodeByQualifiedId(rootGraph, qid) {
     return graph?.getNodeById?.(leafId) || null;
 }
 
+const MAX_PREVIEW_B64_BYTES = 32 * 1024 * 1024;
+
 function b64ToBlob(b64, mime) {
+    if (typeof b64 !== "string" || b64.length > MAX_PREVIEW_B64_BYTES) {
+        throw new Error("preview payload is missing or too large");
+    }
     const bin = atob(b64);
     const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
@@ -100,14 +105,106 @@ function createSlot(stage) {
 
     let imgIdx = 0;
     let vidIdx = 0;
-    let visible = null;   // element currently shown when this slot is active
-    let url = null;       // object URL backing `visible`
+    let visible = null;
+    let url = null;
     let active = false;
+    let generation = 0;
+    let disposed = false;
+    let pendingUpdate = null;
+    let processingUpdate = false;
 
     function show(elem) {
         if (visible && visible !== elem) visible.style.opacity = "0";
         visible = elem;
         if (active) elem.style.opacity = "1";
+    }
+
+    function waitForVideo(v) {
+        if (v.readyState >= 2) return Promise.resolve();
+        return new Promise(resolve => {
+            let doneCalled = false;
+            const done = () => {
+                if (doneCalled) return;
+                doneCalled = true;
+                clearTimeout(timer);
+                v.removeEventListener("loadeddata", done);
+                v.removeEventListener("error", done);
+                resolve();
+            };
+            const timer = setTimeout(done, 3000);
+            v.addEventListener("loadeddata", done, { once: true });
+            v.addEventListener("error", done, { once: true });
+        });
+    }
+
+    // Serialize swaps and coalesce work that arrives while the browser is decoding.
+    // This prevents an older frame from replacing a newer one or retaining every
+    // in-flight base64 payload during a slow video decode.
+    async function processPending() {
+        if (processingUpdate) return;
+        processingUpdate = true;
+        try {
+            while (pendingUpdate) {
+                const job = pendingUpdate;
+                pendingUpdate = null;
+                if (disposed || job.generation !== generation) {
+                    job.resolve(false);
+                    continue;
+                }
+                let nextUrl = null;
+                try {
+                    const blob = b64ToBlob(job.b64, job.mime);
+                    nextUrl = URL.createObjectURL(blob);
+                    if (job.mime === "video/mp4") {
+                        const v = videos[vidIdx ^= 1];
+                        v.src = nextUrl;
+                        await v.play().catch(() => {});
+                        await waitForVideo(v);
+                        if (disposed || job.generation !== generation) {
+                            URL.revokeObjectURL(nextUrl);
+                            job.resolve(false);
+                            continue;
+                        }
+                        show(v);
+                    } else {
+                        const i = imgs[imgIdx ^= 1];
+                        i.src = nextUrl;
+                        if (i.decode) await i.decode().catch(() => {});
+                        if (disposed || job.generation !== generation) {
+                            URL.revokeObjectURL(nextUrl);
+                            job.resolve(false);
+                            continue;
+                        }
+                        show(i);
+                    }
+                    const prevUrl = url;
+                    url = nextUrl;
+                    if (prevUrl) URL.revokeObjectURL(prevUrl);
+                    job.resolve(true);
+                } catch (err) {
+                    if (nextUrl) URL.revokeObjectURL(nextUrl);
+                    job.reject(err);
+                }
+            }
+        } finally {
+            processingUpdate = false;
+            if (pendingUpdate) void processPending();
+        }
+    }
+
+    function update(b64, mime) {
+        const mine = ++generation;
+        if (pendingUpdate) pendingUpdate.resolve(false);
+        const promise = new Promise((resolve, reject) => {
+            pendingUpdate = { b64, mime, generation: mine, resolve, reject };
+        });
+        void processPending();
+        return promise;
+    }
+
+    function cancelPending() {
+        if (pendingUpdate) pendingUpdate.resolve(false);
+        pendingUpdate = null;
     }
 
     return {
@@ -118,35 +215,48 @@ function createSlot(stage) {
                 e.style.opacity = (v && e === visible) ? "1" : "0";
             }
         },
-        // Decode into the *hidden* buffer, then swap, so the stage never flashes empty.
-        async update(b64, mime) {
-            const blob = b64ToBlob(b64, mime);
-            const nextUrl = URL.createObjectURL(blob);
-            const prevUrl = url;
-            try {
-                if (mime === "video/mp4") {
-                    const v = videos[vidIdx ^= 1];
-                    v.src = nextUrl;
-                    await v.play().catch(() => {});
-                    show(v);
-                } else {
-                    const i = imgs[imgIdx ^= 1];
-                    i.src = nextUrl;
-                    if (i.decode) await i.decode().catch(() => {});
-                    show(i);
-                }
-                url = nextUrl;
-                if (prevUrl) URL.revokeObjectURL(prevUrl);
-            } catch (err) {
-                URL.revokeObjectURL(nextUrl);
-                throw err;
+        update,
+        reset() {
+            disposed = false;
+            generation++;
+            cancelPending();
+            if (url) URL.revokeObjectURL(url);
+            url = null;
+            visible = null;
+            for (const e of [...imgs, ...videos]) {
+                e.style.opacity = "0";
+                e.removeAttribute("src");
+                if (e.tagName === "VIDEO") e.load();
             }
         },
         dispose() {
+            disposed = true;
+            generation++;
+            cancelPending();
             if (url) URL.revokeObjectURL(url);
             url = null;
+            visible = null;
+            for (const e of [...imgs, ...videos]) {
+                e.style.opacity = "0";
+                if (e.tagName === "VIDEO") e.pause();
+                e.removeAttribute("src");
+                if (e.tagName === "VIDEO") e.load();
+            }
         },
     };
+}
+
+let executionActive = false;
+let frontendPromptId = null;
+api.addEventListener("execution_start", (e) => {
+    const data = e.detail || {};
+    executionActive = true;
+    frontendPromptId = data.prompt_id == null ? null : String(data.prompt_id);
+});
+for (const terminalEvent of ["execution_success", "execution_error", "execution_interrupted"]) {
+    api.addEventListener(terminalEvent, () => {
+        executionActive = false;
+    });
 }
 
 app.registerExtension({
@@ -218,7 +328,43 @@ app.registerExtension({
                 });
             }
 
+            let activeRunId = null;
+            let activePromptId = null;
+            let lastProgressStep = -1;
+
             node._mmh3Handler = (data) => {
+                // Prompt IDs reject late frames from a prior execution. The run ID
+                // additionally rejects late worker frames within the same prompt.
+                const runId = data.run_id == null ? null : String(data.run_id);
+                const promptId = data.prompt_id == null ? null : String(data.prompt_id);
+                if (frontendPromptId && promptId && promptId !== frontendPromptId) return;
+                if (activePromptId && promptId && promptId !== activePromptId) return;
+
+                // Boundary-0 is the only event allowed to establish a new run. Do not
+                // let a late non-boundary frame claim a node after a page refresh.
+                const startsRun = data.step === 0 && runId && runId !== activeRunId;
+                if (startsRun) {
+                    if (executionActive && frontendPromptId && promptId && promptId !== frontendPromptId) return;
+                    activeRunId = runId;
+                    activePromptId = promptId;
+                    lastProgressStep = -1;
+                    userPinned = false;
+                    current = "latent";
+                    for (const s of SOURCES) slots[s].reset();
+                    select("latent");
+                    placeholder.style.display = "flex";
+                } else {
+                    if (runId && activeRunId && runId !== activeRunId) return;
+                    if (runId && !activeRunId && data.step !== 0) return;
+                    if (runId && !activeRunId) activeRunId = runId;
+                }
+                if (Number.isFinite(data.step) && data.step >= lastProgressStep) {
+                    lastProgressStep = data.step;
+                } else if (Number.isFinite(data.step)) {
+                    // A slow VAE job may legitimately trail the cheap stream. Keep
+                    // its media, but do not move the shared progress display backward.
+                    data = { ...data, step: undefined };
+                }
                 if (Number.isFinite(data.total) && data.total > 0 && Number.isFinite(data.step)) {
                     progressFill.style.width = `${Math.min(100, (data.step / data.total) * 100)}%`;
                     stepEl.textContent = `step ${data.step}/${data.total}`;
@@ -238,7 +384,8 @@ app.registerExtension({
                     available[source] = true;
                     tabEls[source].classList.remove("disabled");
                 }
-                slots[source].update(data.image, data.mime || "image/jpeg").then(() => {
+                slots[source].update(data.image, data.mime || "image/jpeg").then((shown) => {
+                    if (!shown) return;
                     placeholder.style.display = "none";
                     // A truer frame is the more interesting one -- surface it once, then leave
                     // the choice to the user. Frames for inactive slots stay hidden.
@@ -254,7 +401,18 @@ app.registerExtension({
             });
 
             select("latent");
-            node.addDOMWidget("preview", "mmh3_preview", root, { serialize: false });
+            const widget = node.addDOMWidget("preview", "mmh3_preview", root, {
+                serialize: false,
+                hideOnZoom: false,
+                getMinHeight: () => 380,
+            });
+            widget.serialize = false;
+            widget.computeLayoutSize = () => ({
+                minWidth: 300,
+                minHeight: 380,
+                maxWidth: 1000000,
+                maxHeight: 1000000,
+            });
             if (node.size[1] < 380) node.setSize([Math.max(node.size[0], 300), 380]);
         });
     },

@@ -98,6 +98,9 @@ completely untouched.
 
 ## The `vae` option, and its real cost
 
+**Supported full-resolution previews use `taeh3`.** The real video-VAE option below is niche: it is
+mainly for very-high-VRAM cards, and most users should leave `vae_decode_every_n_steps` at `0`.
+
 Read this before turning it on. With `taeh3` available, this option is mostly obsolete — it exists
 for when you want the model's *actual* decoder rather than an approximation of it.
 
@@ -128,3 +131,41 @@ first time one lands, then leaves the choice to you.
 
 ComfyUI with MiniMax H3 support (`comfy/ldm/minimax/`), Pillow, and PyAV. Tested against
 `comfyui-frontend-package==1.47.12` on Windows / RTX 3090.
+
+
+## Audit notes / remaining host limitations
+
+The plugin has been hardened against the issues found in the installed ComfyUI checkout. The
+following items are intentionally **not** changed here because they belong to ComfyUI core or
+the separate H3 loader/VAE implementation:
+
+- **Core `NestedTensor` callback contract:** the sampler still packs AV latents and reconstructs
+  the nested callback view in `comfy/samplers.py`. If that contract changes upstream, this node's
+  `unpack_latents` integration must be re-checked against the new sampler API.
+- **Core `PromptServer` routing:** events are sent to the current `PromptServer.client_id`, as
+  ComfyUI's progress system does. Multi-client/server routing changes need a corresponding core
+  event-targeting update; this plugin does not add a server route or broadcast previews.
+- **Full H3 video-VAE memory behavior:** the ~5.2 GiB VAE and transformer eviction/reload cost are
+  properties of the connected VAE and ComfyUI model-management layer. The node can choose CPU or
+  GPU and serialize shared-VAE access, but cannot make the GPU decode co-resident or interrupt an
+  in-flight CPU convolution safely. This path is intentionally niche; `taeh3` is the supported
+  full-resolution preview.
+- **PyAV/NVENC availability:** codec support is supplied by the installed PyAV wheel and NVIDIA
+  driver. The node falls back to animated WebP, but cannot install or repair those external
+  dependencies.
+- **Frontend lifecycle/version compatibility:** the node uses the current `window.comfyAPI`
+  extension API. If an older frontend omits that API or changes qualified execution IDs, the
+  frontend must be adapted to that host version.
+
+These are follow-up items for later rather than silently ignored risks.
+
+For a no-server regression check of the plugin-side hardening, run:
+
+```bat
+set PYTHONPATH=C:\comfycli;C:\comfycli\custom_nodes
+python custom_nodes\ComfyUI-MiniMaxH3-LivePreview\_offline_verify.py
+```
+
+from the ComfyUI root. Live TAE/latent acceptance can be re-checked with
+`_live_accept_preview.py` while ComfyUI is running. Full video-VAE preview acceptance is out of
+scope.

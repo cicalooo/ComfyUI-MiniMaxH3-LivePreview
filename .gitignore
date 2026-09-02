@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+_live_accept_preview_report.json

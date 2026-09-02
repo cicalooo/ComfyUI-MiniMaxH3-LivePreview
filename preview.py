@@ -20,6 +20,7 @@ import logging
 import queue
 import threading
 import time
+import uuid
 
 import numpy as np
 import torch
@@ -40,13 +41,36 @@ try:
 except ImportError:
     PromptServer = None
 
+try:
+    from comfy_execution.utils import get_executing_context
+except ImportError:  # pragma: no cover - compatibility with older ComfyUI builds
+    get_executing_context = None
+
 EVENT = "minimax_h3_preview"
+
+# Suppressing the stock preview requires a temporary class-level patch because the
+# sampler creates the previewer before this OUTER_SAMPLE wrapper runs.  Keep that
+# patch serialized: two simultaneous prompts must not restore each other's methods.
+_PREVIEW_SUPPRESS_LOCK = threading.RLock()
 
 _RESAMPLE = {
     "nearest-exact": Image.NEAREST,
     "lanczos": Image.LANCZOS,
     "bilinear": Image.BILINEAR,
 }
+
+# Bound the amount of image data held/encoded by one event. Schema limits protect
+# normal workflows, but old workflows can still carry arbitrary values.
+_MAX_PREVIEW_PIXELS = 64 * 512 * 512
+
+
+def _bounded_int(value, default, minimum, maximum):
+    """Convert an untrusted/legacy workflow value into a bounded integer."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        value = default
+    return min(maximum, max(minimum, value))
 
 
 # --------------------------------------------------------------------------------------
@@ -72,18 +96,33 @@ _NVENC_MIN_H = 49
 
 _nvenc_warned = False
 
+# A VAE object can be shared by nodes/prompts. CPU preview temporarily moves its
+# first_stage_model, so access to a shared VAE must be serialized.
+_VAE_LOCKS = {}
+_VAE_LOCKS_GUARD = threading.Lock()
+
+
+def _get_vae_lock(vae):
+    key = id(vae)
+    with _VAE_LOCKS_GUARD:
+        return _VAE_LOCKS.setdefault(key, threading.RLock())
+
 
 class _Worker:
     """Single background thread with a bounded drop-on-full queue.
 
     The sampler must never block on preview work, so a full queue drops the job.
+    Shutdown is event based rather than sentinel based: a full queue can no longer
+    prevent the worker from reaching its close hook, which is important for restoring
+    a CPU-pinned VAE.
     """
 
-    _STOP = object()
-
     def __init__(self, name, maxsize, on_close=None):
-        self.q = queue.Queue(maxsize=maxsize)
+        self.q = queue.Queue(maxsize=max(1, int(maxsize)))
         self.closed = False
+        self._stopping = threading.Event()
+        self._drain_on_stop = True
+        self._state_lock = threading.Lock()
         self.on_close = on_close
         self.thread = threading.Thread(target=self._run, name=name, daemon=True)
         self.thread.start()
@@ -95,44 +134,71 @@ class _Worker:
         not wait for us. `block_timeout` is for jobs worth waiting on -- the final step,
         whose frame is what the panel is left showing.
         """
-        if self.closed:
-            return False
-        try:
-            if block_timeout is None:
-                self.q.put_nowait(fn)
-            else:
-                self.q.put(fn, timeout=block_timeout)
-            return True
-        except queue.Full:
-            return False
+        # Keep the closed check and queue insertion atomic with respect to shutdown.
+        # Otherwise shutdown can observe an empty queue, clear it, and then a racing
+        # submit can enqueue work after the worker has decided to exit.
+        with self._state_lock:
+            if self.closed:
+                return False
+            try:
+                if block_timeout is None:
+                    self.q.put_nowait(fn)
+                else:
+                    self.q.put(fn, timeout=max(0.0, float(block_timeout)))
+                return True
+            except queue.Full:
+                return False
+
+    def _close(self):
+        if self.on_close is not None:
+            try:
+                self.on_close()
+            except Exception:
+                logging.exception("[MiniMaxH3Preview] worker close hook failed")
 
     def _run(self):
         while True:
-            item = self.q.get()
-            if item is self._STOP:
-                # Runs after any in-flight job, on this thread, so cleanup can never
-                # race a decode that is still using the weights it wants to move back.
-                if self.on_close is not None:
-                    try:
-                        self.on_close()
-                    except Exception:
-                        logging.exception("[MiniMaxH3Preview] worker close hook failed")
+            try:
+                item = self.q.get(timeout=0.1)
+            except queue.Empty:
+                if self._stopping.is_set():
+                    self._close()
+                    return
+                continue
+
+            if self._stopping.is_set() and not self._drain_on_stop:
+                self._close()
                 return
             try:
                 item()
             except Exception:
                 logging.exception("[MiniMaxH3Preview] worker error")
 
-    def shutdown(self, drain_timeout=5.0):
-        self.closed = True
-        try:
-            self.q.put(self._STOP, timeout=drain_timeout)
-        except queue.Full:
-            pass
+            # submit() is closed before shutdown clears the queue, so an empty queue
+            # here is a stable indication that all drainable work has finished.
+            if self._stopping.is_set() and (not self._drain_on_stop or self.q.empty()):
+                self._close()
+                return
+
+    def shutdown(self, drain_timeout=5.0, drain=True):
+        with self._state_lock:
+            self.closed = True
+            self._drain_on_stop = bool(drain)
+            self._stopping.set()
+
+        if not drain:
+            # Do not start expensive queued VAE decodes after the sampler has ended.
+            # An already-running decode cannot be interrupted safely, but it will
+            # still execute _close() and restore the VAE when it completes.
+            while True:
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    break
+
         # Join is best-effort: a CPU VAE decode can run for minutes and cannot be
-        # interrupted. The thread is a daemon and still honours _STOP (and on_close)
-        # once it gets there.
-        self.thread.join(timeout=drain_timeout)
+        # interrupted. The thread is a daemon and will finish cleanup eventually.
+        self.thread.join(timeout=max(0.0, float(drain_timeout)))
 
 
 def _fit(pil, max_res, resample):
@@ -141,7 +207,11 @@ def _fit(pil, max_res, resample):
     Unlike ImageOps.contain this scales *up* too -- latent-resolution frames are ~84x48
     and would otherwise arrive unreadably small.
     """
-    if not max_res or max_res <= 0:
+    try:
+        max_res = int(max_res)
+    except (TypeError, ValueError, OverflowError):
+        max_res = 0
+    if max_res <= 0 or pil.width <= 0 or pil.height <= 0:
         return pil
     w, h = pil.width, pil.height
     if max(w, h) == max_res:
@@ -211,7 +281,7 @@ def _encode_animated_webp(frames, fps, quality):
         pil_frames[0].save(
             buf, format="WEBP", save_all=True, append_images=pil_frames[1:],
             duration=max(1, int(round(1000 / max(1, fps)))), loop=0,
-            quality=quality, method=4,
+            quality=max(1, min(100, int(quality))), method=4,
         )
     except Exception as e:
         logging.warning(f"[MiniMaxH3Preview] animated WebP encode failed: {e}")
@@ -223,7 +293,7 @@ def _encode_jpeg(pil, quality):
     if pil.mode != "RGB":
         pil = pil.convert("RGB")
     buf = pyio.BytesIO()
-    pil.save(buf, format="JPEG", quality=quality)
+    pil.save(buf, format="JPEG", quality=max(1, min(100, int(quality))))
     return base64.b64encode(buf.getvalue()).decode("ascii"), pil.width, pil.height
 
 
@@ -322,6 +392,7 @@ class _VaeDecoder:
         self.frames = max(1, frames)
         self.device = None          # resolved on first decode, once the DiT is resident
         self._restore = None        # (module, device, dtype) for the CPU path
+        self._lock = _get_vae_lock(vae)
 
     def _weight_bytes(self):
         m = self.vae.first_stage_model
@@ -366,45 +437,61 @@ class _VaeDecoder:
 
     def resolve(self, video):
         """Pick gpu vs cpu. Call on the sampler thread -- it reads live free VRAM,
-        which is only meaningful once the transformer is resident."""
+        which is only meaningful once the transformer is resident.
+
+        Once resolved, do not take the decode lock: a CPU decode may be in flight and
+        the sampler must be able to drop the next queued decode instead of stalling.
+        """
         if self.device is None:
-            z_shape = (1, video.shape[1], 1, video.shape[3], video.shape[4])
-            self._resolve_device(video.device, z_shape)
+            with self._lock:
+                if self.device is None:
+                    z_shape = (1, video.shape[1], 1, video.shape[3], video.shape[4])
+                    self._resolve_device(video.device, z_shape)
         return self.device
 
     def decode(self, video):
         """[B, 24, T, h, w] -> list of full-resolution PIL frames. resolve() first."""
-        t_total = video.shape[2]
-        idx = _pick_indices(t_total, self.frames)
-        out = []
-        for i in idx:
-            z = video[:1, :, i:i + 1]
-            if self.device == "gpu":
-                px = self.vae.decode(z)                             # [B, T, H, W, C] in 0..1
-            else:
-                self._pin_cpu()
-                with torch.no_grad():
-                    px = self.vae.first_stage_model.decode(z.to(device="cpu", dtype=torch.float32))
-                # first_stage_model.decode returns [B, C, T, H, W] in -1..1; mirror the
-                # default VAE.process_output plus the movedim VAE.decode applies.
-                px = px.movedim(1, -1).add_(1.0).div_(2.0).clamp_(0.0, 1.0)
-            if px.ndim == 5:
-                px = px[0]
-            if px.ndim != 4:
-                continue
-            u8 = (px.float() * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
-            out.extend(Image.fromarray(u8[j]) for j in range(u8.shape[0]))
-        return out
+        with self._lock:
+            if self.device not in ("gpu", "cpu"):
+                raise RuntimeError("VAE preview device was not resolved")
+            t_total = video.shape[2]
+            idx = _pick_indices(t_total, self.frames)
+            out = []
+            for i in idx:
+                z = video[:1, :, i:i + 1]
+                if self.device == "gpu":
+                    px = self.vae.decode(z)                         # [B, T, H, W, C] in 0..1
+                else:
+                    self._pin_cpu()
+                    with torch.no_grad():
+                        px = self.vae.first_stage_model.decode(z.to(device="cpu", dtype=torch.float32))
+                    # Match the host VAE.decode contract. Current MiniMax H3's
+                    # first_stage_model already returns [0, 1], while older builds may
+                    # still expose the generic [-1, 1] process_output transform.
+                    process_output = getattr(self.vae, "process_output", None)
+                    if process_output is not None:
+                        processed = process_output(px)
+                        if processed is not None:
+                            px = processed
+                    px = px.movedim(1, -1).clamp_(0.0, 1.0)
+                if px.ndim == 5:
+                    px = px[0]
+                if px.ndim != 4:
+                    continue
+                u8 = (px.float() * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+                out.extend(Image.fromarray(u8[j]) for j in range(u8.shape[0]))
+            return out
 
     def restore(self):
-        if self._restore is None:
-            return
-        m, device, dtype = self._restore
-        self._restore = None
-        try:
-            m.to(device=device, dtype=dtype)
-        except Exception as e:
-            logging.warning(f"[MiniMaxH3Preview] could not restore VAE to {device}/{dtype}: {e}")
+        with self._lock:
+            if self._restore is None:
+                return
+            m, device, dtype = self._restore
+            self._restore = None
+            try:
+                m.to(device=device, dtype=dtype)
+            except Exception as e:
+                logging.warning(f"[MiniMaxH3Preview] could not restore VAE to {device}/{dtype}: {e}")
 
 
 # --------------------------------------------------------------------------------------
@@ -421,31 +508,49 @@ class _H3PreviewWrapper:
                  vae=None, vae_every_n_steps=0, vae_frames=1, vae_device="auto"):
         self.node_id = str(node_id) if node_id is not None else None
         self.tae_decoder = tae_decoder
-        self.preview_frames = max(1, preview_frames)
-        self.preview_fps = max(1, preview_fps)
-        self.max_resolution = max_resolution
-        self.every_n_steps = max(1, every_n_steps)
+        # Schema validation normally enforces these bounds, but wrappers can also
+        # be invoked by old/cached workflows or directly by third-party nodes.
+        self.preview_frames = _bounded_int(preview_frames, 8, 1, 256)
+        self.preview_fps = _bounded_int(preview_fps, 8, 1, 60)
+        self.max_resolution = _bounded_int(max_resolution, 512, 0, 4096)
+        self.every_n_steps = _bounded_int(every_n_steps, 1, 1, 100)
         self.resample = _RESAMPLE.get(upscale_method, Image.NEAREST)
-        self.jpeg_quality = jpeg_quality
-        self.suppress_default = suppress_default
+        self.jpeg_quality = _bounded_int(jpeg_quality, 80, 30, 100)
+        self.suppress_default = bool(suppress_default)
         self.vae = vae
-        self.vae_every_n_steps = max(0, vae_every_n_steps)
-        self.vae_frames = max(1, vae_frames)
-        self.vae_device = vae_device
+        self.vae_every_n_steps = _bounded_int(vae_every_n_steps, 0, 0, 100)
+        self.vae_frames = _bounded_int(vae_frames, 1, 1, 16)
+        self.vae_device = vae_device if vae_device in ("auto", "gpu", "cpu") else "auto"
 
     # -- plumbing ----------------------------------------------------------------------
 
-    def _send(self, payload):
+    def _send(self, payload, run_id=None, prompt_id=None, client_id=None):
         if self.node_id is None or PromptServer is None:
             return
+        payload = dict(payload)
         payload["node_id"] = self.node_id
+        if run_id is not None:
+            payload["run_id"] = run_id
+        if prompt_id is not None:
+            payload["prompt_id"] = prompt_id
         try:
-            PromptServer.instance.send_sync(EVENT, payload, PromptServer.instance.client_id)
+            server = getattr(PromptServer, "instance", None)
+            # Never broadcast previews from a headless/CLI execution to unrelated
+            # browser sessions. The normal UI path supplies the target captured at
+            # the start of this sampling run.
+            if server is None or client_id is None:
+                return
+            server.send_sync(EVENT, payload, client_id)
         except Exception as e:
             logging.warning(f"[MiniMaxH3Preview] send failed: {e}")
 
     def _frames_to_payload(self, frames, source):
         frames = [_fit(f, self.max_resolution, self.resample) for f in frames]
+        if len(frames) > 1:
+            pixels = max(1, frames[0].width * frames[0].height)
+            allowed = max(1, _MAX_PREVIEW_PIXELS // pixels)
+            if allowed < len(frames):
+                frames = [frames[i] for i in _pick_indices(len(frames), allowed)]
         b64, w, h, mime = _encode_frames(frames, self.preview_fps, self.jpeg_quality)
         if not b64:
             return None
@@ -479,6 +584,12 @@ class _H3PreviewWrapper:
 
         latent_format = model_patcher.model.latent_format
         original_callback = callback
+        run_id = uuid.uuid4().hex
+        context = get_executing_context() if get_executing_context is not None else None
+        prompt_id = getattr(context, "prompt_id", None)
+        prompt_id = str(prompt_id) if prompt_id is not None else None
+        server = getattr(PromptServer, "instance", None) if PromptServer is not None else None
+        target_client_id = getattr(server, "client_id", None) if server is not None else None
         sigmas_list = sigmas.detach().cpu().tolist() if sigmas is not None else []
         total_steps_init = max(0, len(sigmas_list) - 1)
 
@@ -527,7 +638,7 @@ class _H3PreviewWrapper:
                     init.update(p)
         except Exception as e:
             logging.warning(f"[MiniMaxH3Preview] initial noise preview failed: {e}")
-        self._send(init)
+        self._send(init, run_id, prompt_id, target_client_id)
 
         state = {"last_time": None, "window": []}
 
@@ -558,7 +669,7 @@ class _H3PreviewWrapper:
                             if p:
                                 p.update({"step": sent, "total": total, "sigma": sigma_val,
                                           "step_ms": step_ms, "avg_step_ms": avg_ms})
-                                self._send(p)
+                                self._send(p, run_id, prompt_id, target_client_id)
                         # The last frame is what the panel is left displaying, so wait for
                         # a queue slot rather than dropping it. Sampling is over anyway.
                         encoder.submit(_send_cheap, block_timeout=5.0 if is_last else None)
@@ -583,7 +694,8 @@ class _H3PreviewWrapper:
                             p = self._frames_to_payload(vframes, "vae")
                             if p:
                                 p.update({"step": sent, "total": total, "sigma": sigma_val})
-                                self._send(p)
+                                self._send(p, run_id, prompt_id, target_client_id)
+
 
                         if device == "gpu":
                             # Synchronous on purpose: VAE.decode -> load_models_gpu mutates
@@ -595,23 +707,30 @@ class _H3PreviewWrapper:
             except Exception as e:
                 logging.warning(f"[MiniMaxH3Preview] preview callback failed: {e}")
             if original_callback is not None:
-                original_callback(step, x0, x, total_steps)
-
-        # Suppress the stock sampler-node preview. Patch every concrete
-        # decode_latent_to_preview_image: subclasses (e.g. VHS's WrappedPreviewer) override
-        # it and would keep emitting their own frames if only the base class were patched.
-        prev_methods = []
-        if self.suppress_default:
-            targets = [latent_preview.LatentPreviewer]
-            stack = list(latent_preview.LatentPreviewer.__subclasses__())
-            while stack:
-                cls = stack.pop()
-                targets.append(cls)
-                stack.extend(cls.__subclasses__())
-            for cls in targets:
-                if "decode_latent_to_preview_image" in cls.__dict__:
-                    prev_methods.append((cls, cls.__dict__["decode_latent_to_preview_image"]))
-                    cls.decode_latent_to_preview_image = _suppressed_preview_image
+                # The stock callback owns the ComfyUI progress bar as well as the
+                # previewer. Suppress only its image result, and only during this
+                # callback invocation; holding the class patch for the whole prompt
+                # would serialize otherwise independent prompts.
+                if self.suppress_default:
+                    with _PREVIEW_SUPPRESS_LOCK:
+                        prev_methods = []
+                        targets = [latent_preview.LatentPreviewer]
+                        stack = list(latent_preview.LatentPreviewer.__subclasses__())
+                        while stack:
+                            cls = stack.pop()
+                            targets.append(cls)
+                            stack.extend(cls.__subclasses__())
+                        for cls in targets:
+                            if "decode_latent_to_preview_image" in cls.__dict__:
+                                prev_methods.append((cls, cls.__dict__["decode_latent_to_preview_image"]))
+                                cls.decode_latent_to_preview_image = _suppressed_preview_image
+                        try:
+                            original_callback(step, x0, x, total_steps)
+                        finally:
+                            for cls, prev in reversed(prev_methods):
+                                cls.decode_latent_to_preview_image = prev
+                else:
+                    original_callback(step, x0, x, total_steps)
 
         try:
             state["last_time"] = time.perf_counter()
@@ -620,15 +739,14 @@ class _H3PreviewWrapper:
         finally:
             encoder.shutdown(drain_timeout=5.0)
             if vae_worker is not None:
-                # Its on_close hook does the VAE restore, whether or not the join times out.
-                vae_worker.shutdown(drain_timeout=2.0)
+                # Do not start queued, obsolete CPU decodes after sampling ends. An
+                # already-running decode finishes and its close hook restores the VAE.
+                vae_worker.shutdown(drain_timeout=2.0, drain=False)
             elif vae_decoder is not None:
                 vae_decoder.restore()
             # After the encoder has drained: a queued job holds only PIL frames, but the
             # decoder's weights should not outlive the run.
             cheap["tae"] = None
-            for cls, prev in prev_methods:
-                cls.decode_latent_to_preview_image = prev
 
 
 # --------------------------------------------------------------------------------------
@@ -739,6 +857,16 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                 upscale_method, jpeg_quality, suppress_default_preview,
                 vae=None, vae_decode_every_n_steps=0, vae_decode_frames=1,
                 vae_decode_device="auto", tae_decoder=TAE_NONE) -> io.NodeOutput:
+        # Normalize once at the node boundary as well as in the wrapper. This keeps
+        # legacy/cached workflows from failing before the wrapper can protect itself.
+        preview_frames = _bounded_int(preview_frames, 8, 1, 256)
+        preview_fps = _bounded_int(preview_fps, 8, 1, 60)
+        max_resolution = _bounded_int(max_resolution, 512, 0, 4096)
+        every_n_steps = _bounded_int(every_n_steps, 1, 1, 100)
+        jpeg_quality = _bounded_int(jpeg_quality, 80, 30, 100)
+        vae_decode_every_n_steps = _bounded_int(vae_decode_every_n_steps, 0, 0, 100)
+        vae_decode_frames = _bounded_int(vae_decode_frames, 1, 1, 16)
+        vae_decode_device = vae_decode_device if vae_decode_device in ("auto", "gpu", "cpu") else "auto"
         if vae_decode_every_n_steps > 0:
             if vae is None:
                 logging.warning(

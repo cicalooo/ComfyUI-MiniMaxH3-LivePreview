@@ -90,6 +90,22 @@ def _pixel_frames_for_latent_t(latent_t):
     return sum(_H3_FRAME_PER_TOKEN[i % 5] for i in range(latent_t))
 
 
+def _latent_slot_offsets(latent_t):
+    """Exclusive-start pixel offsets for each latent token on the H3 grid."""
+    try:
+        latent_t = int(latent_t)
+    except (TypeError, ValueError, OverflowError):
+        return []
+    if latent_t <= 0:
+        return []
+    offsets = []
+    cursor = 0
+    for i in range(latent_t):
+        offsets.append(cursor)
+        cursor += _H3_FRAME_PER_TOKEN[i % 5]
+    return offsets
+
+
 def _as_fraction_rate(rate):
     """Normalize an encode rate for PyAV / WebP without integer rounding drift."""
     if isinstance(rate, Fraction):
@@ -113,20 +129,17 @@ def _as_fraction_rate(rate):
 
 
 def _frame_duration_ms(fps):
-    """Per-frame duration for animated WebP, derived from an exact encode rate."""
+    """Uniform per-frame duration for animated WebP (legacy / fallback path)."""
     rate = float(_as_fraction_rate(fps))
     return max(1, int(round(1000.0 / rate)))
 
 
 def _encode_fps(content_fps, preview_frame_count, pixel_frame_count):
-    """Convert a content-timeline fps (24 = realtime) into an encoder fps.
+    """Average encoder fps that spans the pixel clip duration.
 
-    Preview payloads only carry a subsample of latent tokens. Playing those
-    tokens at the content fps makes the clip appear fast-forwarded; scale so
-    ``content_fps == 24`` spans the same duration as the underlying pixel clip.
-
-    Returns a ``Fraction`` so NVENC/libx264 can keep the exact rate. Rounding
-    ``8 * 24 / 124`` to ``2`` used to make a ~5.17s clip play in 4.0s (~1.29x).
+    Prefer timeline-aware encoding via ``_preview_timeline`` / PTS. This average
+    rate remains as a fallback and for payload reporting when only frame counts
+    are known.
     """
     content_fps = _bounded_int(content_fps, _H3_CONTENT_FPS, 1, 60)
     try:
@@ -146,6 +159,40 @@ def _encode_fps(content_fps, preview_frame_count, pixel_frame_count):
     return _as_fraction_rate(
         Fraction(preview_frame_count * content_fps, pixel_frame_count)
     )
+
+
+def _preview_timeline(latent_indices, latent_t, content_fps):
+    """Map sampled latent indices onto the H3 pixel timeline.
+
+    Returns ``(pixel_offsets, duration_ms_list, encode_fps, pixel_frame_count)``.
+
+    H3 tokens cover uneven pixel spans ``(1,4,4,4,4)``. A flat average encode
+    rate therefore cannot keep subsampled previews on the content clock;
+    timestamps / per-frame durations must follow the actual pixel offsets.
+    """
+    content_fps = _bounded_int(content_fps, _H3_CONTENT_FPS, 1, 60)
+    offsets_all = _latent_slot_offsets(latent_t)
+    pixel_frame_count = _pixel_frames_for_latent_t(latent_t)
+    try:
+        indices = [int(i) for i in latent_indices]
+    except (TypeError, ValueError, OverflowError):
+        indices = []
+    if not indices or not offsets_all or pixel_frame_count <= 0:
+        n = max(1, len(indices) if indices else 1)
+        encode_fps = _encode_fps(content_fps, n, pixel_frame_count)
+        uniform = _frame_duration_ms(encode_fps)
+        return list(range(n)), [uniform] * n, encode_fps, pixel_frame_count
+
+    clamped = [min(max(0, i), len(offsets_all) - 1) for i in indices]
+    pixel_offsets = [offsets_all[i] for i in clamped]
+    # Hold each sample until the next sample; hold the last sample through the
+    # final pixel frame so total duration == pixel_frame_count / content_fps.
+    ends = pixel_offsets[1:] + [pixel_frame_count]
+    spans = [max(1, end - start) for start, end in zip(pixel_offsets, ends)]
+    duration_ms = [max(1, int(round(span * 1000.0 / content_fps))) for span in spans]
+    # Keep the reported average rate honest for UI/debug, but encoding uses PTS.
+    encode_fps = _encode_fps(content_fps, len(pixel_offsets), pixel_frame_count)
+    return pixel_offsets, duration_ms, encode_fps, pixel_frame_count
 
 
 # --------------------------------------------------------------------------------------
@@ -295,9 +342,11 @@ def _fit(pil, max_res, resample):
     return pil.resize((max(1, round(w * scale)), max(1, round(h * scale))), resample)
 
 
-def _encode_mp4_nvenc(frames, fps):
+def _encode_mp4_nvenc(frames, fps, pixel_offsets=None, pixel_frame_count=None, content_fps=None):
     """Fragmented MP4 so the browser can decode mid-download.
 
+    When ``pixel_offsets`` are provided, frames are stamped onto the H3 pixel
+    timeline at ``content_fps`` (24 = realtime) instead of a flat average rate.
     Returns (None, 0, 0) on any failure -- including too-small-for-NVENC -- so the
     caller falls through to WebP.
     """
@@ -318,6 +367,30 @@ def _encode_mp4_nvenc(frames, fps):
     if out_w < _NVENC_MIN_W or out_h < _NVENC_MIN_H:
         return None, 0, 0
 
+    use_timeline = (
+        pixel_offsets is not None
+        and len(pixel_offsets) == len(pil_frames)
+        and pixel_frame_count is not None
+        and int(pixel_frame_count) > 0
+    )
+    if use_timeline:
+        content_fps = _bounded_int(content_fps, _H3_CONTENT_FPS, 1, 60)
+        stream_rate = Fraction(content_fps, 1)
+        pts_list = [int(p) for p in pixel_offsets]
+        # Duplicate the last sample one content-frame before the clip end so the
+        # container duration lands on pixel_frame_count / content_fps. Without
+        # that trailing PTS, MP4 duration stops at the last sample's start time.
+        end_pts = max(pts_list[-1] + 1, int(pixel_frame_count) - 1)
+        if end_pts != pts_list[-1]:
+            pts_list = list(pts_list) + [end_pts]
+            encode_frames = list(pil_frames) + [pil_frames[-1]]
+        else:
+            encode_frames = pil_frames
+    else:
+        stream_rate = _as_fraction_rate(fps)
+        pts_list = None
+        encode_frames = pil_frames
+
     # Driver/GPU varies in what option combos are accepted; a bare preset always works.
     last_err = None
     for opts in ({"preset": "p1", "rc": "vbr", "cq": "23"}, {"preset": "p1"}):
@@ -327,13 +400,16 @@ def _encode_mp4_nvenc(frames, fps):
                 buf, mode="w", format="mp4",
                 options={"movflags": "frag_keyframe+empty_moov+default_base_moof"},
             )
-            stream = container.add_stream("h264_nvenc", rate=_as_fraction_rate(fps))
+            stream = container.add_stream("h264_nvenc", rate=stream_rate)
             stream.width = out_w
             stream.height = out_h
             stream.pix_fmt = "yuv420p"
             stream.options = opts
-            for pf in pil_frames:
-                for pkt in stream.encode(av.VideoFrame.from_image(pf)):
+            for i, pf in enumerate(encode_frames):
+                frame = av.VideoFrame.from_image(pf)
+                if pts_list is not None:
+                    frame.pts = pts_list[i]
+                for pkt in stream.encode(frame):
                     container.mux(pkt)
             for pkt in stream.encode():
                 container.mux(pkt)
@@ -347,15 +423,23 @@ def _encode_mp4_nvenc(frames, fps):
     return None, 0, 0
 
 
-def _encode_animated_webp(frames, fps, quality):
+def _encode_animated_webp(frames, fps, quality, durations_ms=None):
     if not frames:
         return None, 0, 0
     pil_frames = [f if f.mode == "RGB" else f.convert("RGB") for f in frames]
+    if (
+        durations_ms is not None
+        and len(durations_ms) == len(pil_frames)
+        and all(isinstance(d, (int, float)) for d in durations_ms)
+    ):
+        duration = [max(1, int(round(d))) for d in durations_ms]
+    else:
+        duration = _frame_duration_ms(fps)
     buf = pyio.BytesIO()
     try:
         pil_frames[0].save(
             buf, format="WEBP", save_all=True, append_images=pil_frames[1:],
-            duration=_frame_duration_ms(fps), loop=0,
+            duration=duration, loop=0,
             quality=max(1, min(100, int(quality))), method=4,
         )
     except Exception as e:
@@ -372,7 +456,8 @@ def _encode_jpeg(pil, quality):
     return base64.b64encode(buf.getvalue()).decode("ascii"), pil.width, pil.height
 
 
-def _encode_frames(frames, fps, quality):
+def _encode_frames(frames, fps, quality, pixel_offsets=None, durations_ms=None,
+                    pixel_frame_count=None, content_fps=None):
     """-> (b64, w, h, mime). Single frame is a JPEG; multiple prefer NVENC MP4."""
     if not frames:
         return None, 0, 0, None
@@ -380,10 +465,15 @@ def _encode_frames(frames, fps, quality):
         b64, w, h = _encode_jpeg(frames[0], quality)
         return b64, w, h, "image/jpeg"
     if _NVENC_AVAILABLE:
-        b64, w, h = _encode_mp4_nvenc(frames, fps)
+        b64, w, h = _encode_mp4_nvenc(
+            frames, fps,
+            pixel_offsets=pixel_offsets,
+            pixel_frame_count=pixel_frame_count,
+            content_fps=content_fps,
+        )
         if b64:
             return b64, w, h, "video/mp4"
-    b64, w, h = _encode_animated_webp(frames, fps, quality)
+    b64, w, h = _encode_animated_webp(frames, fps, quality, durations_ms=durations_ms)
     return b64, w, h, "image/webp"
 
 
@@ -398,16 +488,17 @@ def _pick_indices(total, count):
 
 
 def _latent_to_pil(video, latent_format, max_frames):
-    """[B, 24, T, h, w] -> list of PIL frames at latent resolution (w x h).
+    """[B, 24, T, h, w] -> (list of PIL frames, latent indices).
 
     One bulk GPU->CPU copy for the whole stack rather than per-frame non_blocking
-    copies, which tear at high resolution.
+    copies, which tear at high resolution. Indices are returned so the encoder can
+    place each sample on the H3 pixel timeline.
     """
     if video is None or video.ndim != 5:
-        return []
+        return [], []
     factors = getattr(latent_format, "latent_rgb_factors", None)
     if factors is None:
-        return []
+        return [], []
     try:
         reshape = getattr(latent_format, "latent_rgb_factors_reshape", None)
         if reshape is not None:
@@ -423,23 +514,23 @@ def _latent_to_pil(video, latent_format, max_frames):
         # linear() allocates, so the in-place scaling below never touches the sampler's tensor
         rgb = torch.nn.functional.linear(x, f, bias=b)
         rgb = rgb.add_(1.0).mul_(127.5).clamp_(0, 255).to(torch.uint8).cpu().numpy()
-        return [Image.fromarray(rgb[i]) for i in range(rgb.shape[0])]
+        return [Image.fromarray(rgb[i]) for i in range(rgb.shape[0])], list(idx)
     except Exception as e:
         logging.warning(f"[MiniMaxH3Preview] latent2rgb decode failed: {e}")
-        return []
+        return [], []
 
 
 def _tae_to_pil(video, tae, max_frames):
-    """[B, 24, T, h, w] -> list of PIL frames at *full* resolution (16x the latent grid).
+    """[B, 24, T, h, w] -> (list of full-res PIL frames, latent indices).
 
     Raises on failure so the caller can fall back to latent2rgb for the rest of the run.
     """
     if video is None or video.ndim != 5:
-        return []
+        return [], []
     idx = _pick_indices(video.shape[2], max_frames)
     rgb = tae.decode_video(video[:1], idx)              # [T, H, W, 3] in 0..1, on the cpu
     u8 = rgb.mul_(255.0).clamp_(0, 255).to(torch.uint8).numpy()
-    return [Image.fromarray(u8[i]) for i in range(u8.shape[0])]
+    return [Image.fromarray(u8[i]) for i in range(u8.shape[0])], list(idx)
 
 
 # --------------------------------------------------------------------------------------
@@ -525,13 +616,14 @@ class _VaeDecoder:
         return self.device
 
     def decode(self, video):
-        """[B, 24, T, h, w] -> list of full-resolution PIL frames. resolve() first."""
+        """[B, 24, T, h, w] -> (PIL frames, latent indices). resolve() first."""
         with self._lock:
             if self.device not in ("gpu", "cpu"):
                 raise RuntimeError("VAE preview device was not resolved")
             t_total = video.shape[2]
             idx = _pick_indices(t_total, self.frames)
             out = []
+            kept = []
             for i in idx:
                 z = video[:1, :, i:i + 1]
                 if self.device == "gpu":
@@ -555,7 +647,8 @@ class _VaeDecoder:
                     continue
                 u8 = (px.float() * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
                 out.extend(Image.fromarray(u8[j]) for j in range(u8.shape[0]))
-            return out
+                kept.append(int(i))
+            return out, kept
 
     def restore(self):
         with self._lock:
@@ -619,25 +712,43 @@ class _H3PreviewWrapper:
         except Exception as e:
             logging.warning(f"[MiniMaxH3Preview] send failed: {e}")
 
-    def _frames_to_payload(self, frames, source, latent_t=None):
+    def _frames_to_payload(self, frames, source, latent_t=None, latent_indices=None):
         frames = [_fit(f, self.max_resolution, self.resample) for f in frames]
+        if latent_indices is None:
+            latent_indices = list(range(len(frames)))
+        else:
+            try:
+                latent_indices = [int(i) for i in latent_indices]
+            except (TypeError, ValueError, OverflowError):
+                latent_indices = list(range(len(frames)))
+        if len(latent_indices) != len(frames):
+            latent_indices = list(range(len(frames)))
         if len(frames) > 1:
             pixels = max(1, frames[0].width * frames[0].height)
             allowed = max(1, _MAX_PREVIEW_PIXELS // pixels)
             if allowed < len(frames):
-                frames = [frames[i] for i in _pick_indices(len(frames), allowed)]
-        pixel_frames = _pixel_frames_for_latent_t(latent_t) if latent_t is not None else 0
-        encode_fps = _encode_fps(self.preview_fps, len(frames), pixel_frames)
-        b64, w, h, mime = _encode_frames(frames, encode_fps, self.jpeg_quality)
+                keep = _pick_indices(len(frames), allowed)
+                frames = [frames[i] for i in keep]
+                latent_indices = [latent_indices[i] for i in keep]
+        pixel_offsets, durations_ms, encode_fps, pixel_frames = _preview_timeline(
+            latent_indices, latent_t, self.preview_fps,
+        )
+        b64, w, h, mime = _encode_frames(
+            frames, encode_fps, self.jpeg_quality,
+            pixel_offsets=pixel_offsets if pixel_frames > 0 else None,
+            durations_ms=durations_ms if pixel_frames > 0 else None,
+            pixel_frame_count=pixel_frames if pixel_frames > 0 else None,
+            content_fps=self.preview_fps,
+        )
         if not b64:
             return None
         return {
             "image": b64, "mime": mime, "w": w, "h": h, "source": source,
             # Report the content-timeline fps the user set (24 = realtime), not the
-            # possibly much lower encoder rate used after latent subsampling.
+            # possibly much lower average encoder rate after latent subsampling.
             "fps": self.preview_fps if mime in ("video/mp4", "image/webp") else None,
             # Float keeps websocket payloads JSON-friendly while preserving the
-            # fractional encode rate (e.g. 48/31 ≈ 1.548 for 8/124 @ 24fps).
+            # fractional average rate (e.g. 48/31 ≈ 1.548 for 8/124 @ 24fps).
             "encode_fps": (
                 float(encode_fps) if mime in ("video/mp4", "image/webp") else None
             ),
@@ -682,23 +793,26 @@ class _H3PreviewWrapper:
         cheap = {"tae": load_tae_decoder(self.tae_decoder)}
 
         def _cheap_frames(video):
-            """-> (frames, source). The tiny VAE when one is loaded, latent2rgb otherwise.
+            """-> (frames, latent_indices, source).
 
-            Runs on the sampler thread like latent2rgb does: taeh3 is ~10 MB and a few
-            milliseconds per frame, and decoding here keeps it off the encoder thread,
-            which would otherwise allocate VRAM concurrently with a forward pass.
+            The tiny VAE when one is loaded, latent2rgb otherwise. Runs on the sampler
+            thread like latent2rgb does: taeh3 is ~10 MB and a few milliseconds per
+            frame, and decoding here keeps it off the encoder thread, which would
+            otherwise allocate VRAM concurrently with a forward pass.
             """
             tae = cheap["tae"]
             if tae is not None:
                 try:
-                    return _tae_to_pil(video, tae, self.preview_frames), "tae"
+                    frames, idx = _tae_to_pil(video, tae, self.preview_frames)
+                    return frames, idx, "tae"
                 except Exception as e:
                     cheap["tae"] = None
                     logging.warning(
                         f"[MiniMaxH3Preview] tiny-VAE decode failed ({e}); falling back to "
                         "latent2rgb for the rest of this run."
                     )
-            return _latent_to_pil(video, latent_format, self.preview_frames), "latent"
+            frames, idx = _latent_to_pil(video, latent_format, self.preview_frames)
+            return frames, idx, "latent"
 
         encoder = _Worker("mmh3_preview_encode", maxsize=2)
         vae_worker = None
@@ -716,8 +830,10 @@ class _H3PreviewWrapper:
             if sigmas is not None and len(sigmas) > 0:
                 s0 = sigmas[0].to(noise.device)
                 video0 = comfy.utils.unpack_latents(noise * s0, latent_shapes)[0]
-                frames0, source0 = _cheap_frames(video0)
-                p = self._frames_to_payload(frames0, source0, latent_t=video0.shape[2])
+                frames0, idx0, source0 = _cheap_frames(video0)
+                p = self._frames_to_payload(
+                    frames0, source0, latent_t=video0.shape[2], latent_indices=idx0,
+                )
                 if p:
                     init.update(p)
         except Exception as e:
@@ -744,14 +860,18 @@ class _H3PreviewWrapper:
                     avg_ms = (sum(state["window"]) / len(state["window"])) if state["window"] else None
                     sigma_val = sigmas_list[step] if 0 <= step < len(sigmas_list) else None
 
-                    frames, source = _cheap_frames(video)
+                    frames, latent_indices, source = _cheap_frames(video)
                     if frames:
                         latent_t = int(video.shape[2])
                         def _send_cheap(frames=frames, source=source, step_ms=step_ms,
                                         avg_ms=avg_ms, sigma_val=sigma_val,
                                         sent=step + 1, total=total_steps,
-                                        latent_t=latent_t):
-                            p = self._frames_to_payload(frames, source, latent_t=latent_t)
+                                        latent_t=latent_t,
+                                        latent_indices=latent_indices):
+                            p = self._frames_to_payload(
+                                frames, source, latent_t=latent_t,
+                                latent_indices=latent_indices,
+                            )
                             if p:
                                 p.update({"step": sent, "total": total, "sigma": sigma_val,
                                           "step_ms": step_ms, "avg_step_ms": avg_ms})
@@ -771,7 +891,7 @@ class _H3PreviewWrapper:
                                       latent_t=latent_t):
                             t0 = time.perf_counter()
                             try:
-                                vframes = vae_decoder.decode(z)
+                                vframes, vidx = vae_decoder.decode(z)
                             except Exception as e:
                                 logging.warning(f"[MiniMaxH3Preview] VAE preview decode failed: {e}")
                                 return
@@ -779,7 +899,9 @@ class _H3PreviewWrapper:
                                 "[MiniMaxH3Preview] VAE preview: %d frame(s) on %s in %.1fs "
                                 "(step %s/%s)", len(vframes), vae_decoder.device,
                                 time.perf_counter() - t0, sent, total)
-                            p = self._frames_to_payload(vframes, "vae", latent_t=latent_t)
+                            p = self._frames_to_payload(
+                                vframes, "vae", latent_t=latent_t, latent_indices=vidx,
+                            )
                             if p:
                                 p.update({"step": sent, "total": total, "sigma": sigma_val})
                                 self._send(p, run_id, prompt_id, target_client_id)

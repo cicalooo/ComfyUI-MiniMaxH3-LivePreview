@@ -145,31 +145,49 @@ def test_content_fps_scaling(pkg):
     # EmptyMiniMaxH3LatentAV length=124 -> latent_t=37, pixel frames=124.
     assert pkg._pixel_frames_for_latent_t(37) == 124
     assert pkg._pixel_frames_for_latent_t(2) == 5
-    # 8 preview frames spanning a 124-frame / 24 fps clip must keep the exact
-    # 48/31 encode rate (~1.548 fps). Rounding that to 2 made realtime ~1.29x fast.
+    assert pkg._latent_slot_offsets(2) == [0, 1]
+    # Average-rate helper still reports the exact fractional rate.
     assert pkg._encode_fps(24, 8, 124) == Fraction(48, 31)
     assert pkg._encode_fps(12, 8, 124) == Fraction(24, 31)
     assert pkg._encode_fps(24, 1, 124) == Fraction(24, 1)
     assert abs(float(pkg._encode_fps(24, 8, 124)) - (8 * 24 / 124)) < 1e-12
-    # WebP duration must also follow the fractional rate (≈646 ms, not 500 ms).
-    assert pkg._frame_duration_ms(Fraction(48, 31)) == 646
+
+    # Evenly spaced latent samples land on uneven pixel offsets under FRAME_PER_TOKEN.
+    idx = [0, 5, 10, 15, 21, 26, 31, 36]
+    offsets, durations_ms, encode_fps, pixel_frames = pkg._preview_timeline(idx, 37, 24)
+    assert pixel_frames == 124
+    assert offsets == [0, 17, 34, 51, 69, 86, 103, 120]
+    assert durations_ms == [708, 708, 708, 750, 708, 708, 708, 167]
+    assert sum(durations_ms) == 5165  # ~124/24 s in ms rounding
+    assert encode_fps == Fraction(48, 31)
 
     wrapper = pkg._H3PreviewWrapper(
         node_id="1",
         preview_frames=8,
         preview_fps=24,
-        max_resolution=64,
+        max_resolution=160,
         every_n_steps=1,
         upscale_method="nearest-exact",
         jpeg_quality=80,
         suppress_default=True,
     )
-    frames = [Image.new("RGB", (64, 48), color=(i * 10, 20, 30)) for i in range(8)]
-    payload = wrapper._frames_to_payload(frames, "latent", latent_t=37)
+    frames = [Image.new("RGB", (160, 96), color=(i * 10, 20, 30)) for i in range(8)]
+    payload = wrapper._frames_to_payload(
+        frames, "latent", latent_t=37, latent_indices=idx,
+    )
     assert payload is not None
     assert payload["fps"] == 24
     assert abs(payload["encode_fps"] - (8 * 24 / 124)) < 1e-9
-    _ok("content fps scales encode rate for subsampled latent clips")
+    assert payload["mime"] in ("video/mp4", "image/webp")
+    raw = base64.b64decode(payload["image"])
+    if payload["mime"] == "video/mp4":
+        import av
+
+        container = av.open(io.BytesIO(raw))
+        duration_s = float(container.duration) / av.time_base
+        assert abs(duration_s - (124 / 24)) < 0.05, duration_s
+        container.close()
+    _ok("content fps uses H3 pixel timeline for subsampled latent clips")
 
 
 def test_pixel_budget(pkg):
@@ -236,14 +254,14 @@ def test_latent2rgb_and_tae(pkg):
     tiny = importlib.import_module("ComfyUI-MiniMaxH3-LivePreview.tiny_vae")
     lf = comfy.latent_formats.MiniMaxH3Video()
     video = torch.randn(1, 24, 8, 6, 10, dtype=torch.float32)
-    frames = pkg._latent_to_pil(video, lf, max_frames=4)
-    assert len(frames) == 4
+    frames, idx = pkg._latent_to_pil(video, lf, max_frames=4)
+    assert len(frames) == 4 and len(idx) == 4
     assert frames[0].size == (10, 6)
 
     tae = tiny.load_tae_decoder("taeh3.safetensors")
     assert tae is not None, "taeh3.safetensors not found under models/vae_approx"
-    frames = pkg._tae_to_pil(video, tae, max_frames=2)
-    assert len(frames) == 2
+    frames, idx = pkg._tae_to_pil(video, tae, max_frames=2)
+    assert len(frames) == 2 and len(idx) == 2
     # 16x spatial upscale from 10x6 -> 160x96
     assert frames[0].size == (160, 96)
     _ok("latent2rgb + taeh3 decode")
@@ -278,8 +296,8 @@ def test_cpu_vae_process_output_contract(pkg):
     decoder = pkg._VaeDecoder(FakeVae(), mode="cpu", frames=1)
     video = torch.zeros(1, 24, 2, 4, 5)
     assert decoder.resolve(video) == "cpu"
-    frames = decoder.decode(video)
-    assert len(frames) == 1
+    frames, idx = decoder.decode(video)
+    assert len(frames) == 1 and idx == [0]
     arr = np.asarray(frames[0])
     # 0.25 * 255 ~= 63.75 -> 63 after uint8 cast
     assert arr.shape == (8, 10, 3)

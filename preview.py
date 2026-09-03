@@ -21,6 +21,7 @@ import queue
 import threading
 import time
 import uuid
+from fractions import Fraction
 
 import numpy as np
 import torch
@@ -89,12 +90,43 @@ def _pixel_frames_for_latent_t(latent_t):
     return sum(_H3_FRAME_PER_TOKEN[i % 5] for i in range(latent_t))
 
 
+def _as_fraction_rate(rate):
+    """Normalize an encode rate for PyAV / WebP without integer rounding drift."""
+    if isinstance(rate, Fraction):
+        value = rate
+    else:
+        try:
+            value = Fraction(rate).limit_denominator(10_000)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            value = Fraction(_H3_CONTENT_FPS, 1)
+    if value <= 0:
+        value = Fraction(1, 10)
+    # Keep encoder rates in a practical preview band. Sub-1 values are valid:
+    # a sparse subsample of a long clip must play slower than 1 fps to stay realtime.
+    lo = Fraction(1, 10)
+    hi = Fraction(60, 1)
+    if value < lo:
+        return lo
+    if value > hi:
+        return hi
+    return value
+
+
+def _frame_duration_ms(fps):
+    """Per-frame duration for animated WebP, derived from an exact encode rate."""
+    rate = float(_as_fraction_rate(fps))
+    return max(1, int(round(1000.0 / rate)))
+
+
 def _encode_fps(content_fps, preview_frame_count, pixel_frame_count):
     """Convert a content-timeline fps (24 = realtime) into an encoder fps.
 
     Preview payloads only carry a subsample of latent tokens. Playing those
     tokens at the content fps makes the clip appear fast-forwarded; scale so
     ``content_fps == 24`` spans the same duration as the underlying pixel clip.
+
+    Returns a ``Fraction`` so NVENC/libx264 can keep the exact rate. Rounding
+    ``8 * 24 / 124`` to ``2`` used to make a ~5.17s clip play in 4.0s (~1.29x).
     """
     content_fps = _bounded_int(content_fps, _H3_CONTENT_FPS, 1, 60)
     try:
@@ -106,13 +138,14 @@ def _encode_fps(content_fps, preview_frame_count, pixel_frame_count):
     except (TypeError, ValueError, OverflowError):
         pixel_frame_count = 0
     if preview_frame_count <= 1:
-        return content_fps
+        return Fraction(content_fps, 1)
     if pixel_frame_count <= 0:
         # Fallback when the latent length is unknown: treat the widget as a
         # direct encode rate (legacy behaviour).
-        return content_fps
-    rate = preview_frame_count * float(content_fps) / float(pixel_frame_count)
-    return max(1, min(60, int(round(rate))))
+        return Fraction(content_fps, 1)
+    return _as_fraction_rate(
+        Fraction(preview_frame_count * content_fps, pixel_frame_count)
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -294,7 +327,7 @@ def _encode_mp4_nvenc(frames, fps):
                 buf, mode="w", format="mp4",
                 options={"movflags": "frag_keyframe+empty_moov+default_base_moof"},
             )
-            stream = container.add_stream("h264_nvenc", rate=int(max(1, fps)))
+            stream = container.add_stream("h264_nvenc", rate=_as_fraction_rate(fps))
             stream.width = out_w
             stream.height = out_h
             stream.pix_fmt = "yuv420p"
@@ -322,7 +355,7 @@ def _encode_animated_webp(frames, fps, quality):
     try:
         pil_frames[0].save(
             buf, format="WEBP", save_all=True, append_images=pil_frames[1:],
-            duration=max(1, int(round(1000 / max(1, fps)))), loop=0,
+            duration=_frame_duration_ms(fps), loop=0,
             quality=max(1, min(100, int(quality))), method=4,
         )
     except Exception as e:
@@ -603,7 +636,11 @@ class _H3PreviewWrapper:
             # Report the content-timeline fps the user set (24 = realtime), not the
             # possibly much lower encoder rate used after latent subsampling.
             "fps": self.preview_fps if mime in ("video/mp4", "image/webp") else None,
-            "encode_fps": encode_fps if mime in ("video/mp4", "image/webp") else None,
+            # Float keeps websocket payloads JSON-friendly while preserving the
+            # fractional encode rate (e.g. 48/31 ≈ 1.548 for 8/124 @ 24fps).
+            "encode_fps": (
+                float(encode_fps) if mime in ("video/mp4", "image/webp") else None
+            ),
         }
 
     def _is_h3(self, model_patcher, latent_shapes):

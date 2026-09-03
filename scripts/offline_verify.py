@@ -140,14 +140,19 @@ def test_encode_paths(pkg):
 
 
 def test_content_fps_scaling(pkg):
+    from fractions import Fraction
+
     # EmptyMiniMaxH3LatentAV length=124 -> latent_t=37, pixel frames=124.
     assert pkg._pixel_frames_for_latent_t(37) == 124
     assert pkg._pixel_frames_for_latent_t(2) == 5
-    # 8 preview frames spanning a 124-frame / 24 fps clip should encode near 1.5 fps,
-    # not 24 fps (which would look ~16x fast-forwarded).
-    assert pkg._encode_fps(24, 8, 124) == 2
-    assert pkg._encode_fps(12, 8, 124) == 1
-    assert pkg._encode_fps(24, 1, 124) == 24
+    # 8 preview frames spanning a 124-frame / 24 fps clip must keep the exact
+    # 48/31 encode rate (~1.548 fps). Rounding that to 2 made realtime ~1.29x fast.
+    assert pkg._encode_fps(24, 8, 124) == Fraction(48, 31)
+    assert pkg._encode_fps(12, 8, 124) == Fraction(24, 31)
+    assert pkg._encode_fps(24, 1, 124) == Fraction(24, 1)
+    assert abs(float(pkg._encode_fps(24, 8, 124)) - (8 * 24 / 124)) < 1e-12
+    # WebP duration must also follow the fractional rate (≈646 ms, not 500 ms).
+    assert pkg._frame_duration_ms(Fraction(48, 31)) == 646
 
     wrapper = pkg._H3PreviewWrapper(
         node_id="1",
@@ -163,7 +168,7 @@ def test_content_fps_scaling(pkg):
     payload = wrapper._frames_to_payload(frames, "latent", latent_t=37)
     assert payload is not None
     assert payload["fps"] == 24
-    assert payload["encode_fps"] == 2
+    assert abs(payload["encode_fps"] - (8 * 24 / 124)) < 1e-9
     _ok("content fps scales encode rate for subsampled latent clips")
 
 

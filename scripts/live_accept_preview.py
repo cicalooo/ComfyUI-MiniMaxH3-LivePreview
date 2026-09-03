@@ -65,7 +65,7 @@ def build_prompt(
             "inputs": {
                 "model": ["3", 0],
                 "preview_frames": 4,
-                "preview_fps": 8,
+                "preview_fps": 24,
                 "max_resolution": 256,
                 "every_n_steps": 1,
                 "upscale_method": "nearest-exact",

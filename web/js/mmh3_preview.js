@@ -256,6 +256,10 @@ api.addEventListener("execution_start", (e) => {
 for (const terminalEvent of ["execution_success", "execution_error", "execution_interrupted"]) {
     api.addEventListener(terminalEvent, () => {
         executionActive = false;
+        // Drop the prompt gate so a later run can claim the panel even if its
+        // boundary-0 event raced ahead of execution_start, or if the browser
+        // missed the next start event entirely.
+        frontendPromptId = null;
     });
 }
 
@@ -332,31 +336,58 @@ app.registerExtension({
             let activePromptId = null;
             let lastProgressStep = -1;
 
+            function beginRun(runId, promptId) {
+                activeRunId = runId;
+                activePromptId = promptId;
+                lastProgressStep = -1;
+                userPinned = false;
+                available.latent = true;
+                available.tae = false;
+                available.vae = false;
+                for (const s of SOURCES) {
+                    tabEls[s].classList.toggle("disabled", !available[s]);
+                }
+                current = "latent";
+                for (const s of SOURCES) slots[s].reset();
+                select("latent");
+                placeholder.style.display = "flex";
+                placeholder.textContent = "waiting for sampler…";
+                progressFill.style.width = "0%";
+                stepEl.textContent = "idle";
+                sigmaEl.textContent = "";
+                rateEl.textContent = "";
+                sizeEl.textContent = "";
+                badge.textContent = "—";
+                badge.removeAttribute("data-source");
+            }
+
             node._mmh3Handler = (data) => {
                 // Prompt IDs reject late frames from a prior execution. The run ID
                 // additionally rejects late worker frames within the same prompt.
                 const runId = data.run_id == null ? null : String(data.run_id);
                 const promptId = data.prompt_id == null ? null : String(data.prompt_id);
                 if (frontendPromptId && promptId && promptId !== frontendPromptId) return;
-                if (activePromptId && promptId && promptId !== activePromptId) return;
 
-                // Boundary-0 is the only event allowed to establish a new run. Do not
-                // let a late non-boundary frame claim a node after a page refresh.
-                const startsRun = data.step === 0 && runId && runId !== activeRunId;
+                // Prefer boundary-0, but also accept the first frame of a new run_id
+                // once a fresh prompt is underway. Missing the noise preview (or a
+                // page refresh mid-queue) used to leave the panel stuck on the prior
+                // generation forever because non-zero steps were refused.
+                const isFreshPrompt = !activePromptId || (promptId && promptId !== activePromptId);
+                const isNewRun = !!(runId && runId !== activeRunId);
+                const startsRun = isNewRun && (
+                    data.step === 0
+                    || (isFreshPrompt && Number.isFinite(data.step))
+                    || (!activeRunId && Number.isFinite(data.step))
+                );
                 if (startsRun) {
                     if (executionActive && frontendPromptId && promptId && promptId !== frontendPromptId) return;
-                    activeRunId = runId;
-                    activePromptId = promptId;
-                    lastProgressStep = -1;
-                    userPinned = false;
-                    current = "latent";
-                    for (const s of SOURCES) slots[s].reset();
-                    select("latent");
-                    placeholder.style.display = "flex";
+                    beginRun(runId, promptId);
                 } else {
+                    if (activePromptId && promptId && promptId !== activePromptId) return;
                     if (runId && activeRunId && runId !== activeRunId) return;
                     if (runId && !activeRunId && data.step !== 0) return;
                     if (runId && !activeRunId) activeRunId = runId;
+                    if (promptId && !activePromptId) activePromptId = promptId;
                 }
                 if (Number.isFinite(data.step) && data.step >= lastProgressStep) {
                     lastProgressStep = data.step;

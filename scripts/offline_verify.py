@@ -139,11 +139,39 @@ def test_encode_paths(pkg):
     _ok("encode jpeg + animated fallback/NVENC")
 
 
+def test_content_fps_scaling(pkg):
+    # EmptyMiniMaxH3LatentAV length=124 -> latent_t=37, pixel frames=124.
+    assert pkg._pixel_frames_for_latent_t(37) == 124
+    assert pkg._pixel_frames_for_latent_t(2) == 5
+    # 8 preview frames spanning a 124-frame / 24 fps clip should encode near 1.5 fps,
+    # not 24 fps (which would look ~16x fast-forwarded).
+    assert pkg._encode_fps(24, 8, 124) == 2
+    assert pkg._encode_fps(12, 8, 124) == 1
+    assert pkg._encode_fps(24, 1, 124) == 24
+
+    wrapper = pkg._H3PreviewWrapper(
+        node_id="1",
+        preview_frames=8,
+        preview_fps=24,
+        max_resolution=64,
+        every_n_steps=1,
+        upscale_method="nearest-exact",
+        jpeg_quality=80,
+        suppress_default=True,
+    )
+    frames = [Image.new("RGB", (64, 48), color=(i * 10, 20, 30)) for i in range(8)]
+    payload = wrapper._frames_to_payload(frames, "latent", latent_t=37)
+    assert payload is not None
+    assert payload["fps"] == 24
+    assert payload["encode_fps"] == 2
+    _ok("content fps scales encode rate for subsampled latent clips")
+
+
 def test_pixel_budget(pkg):
     wrapper = pkg._H3PreviewWrapper(
         node_id="1",
         preview_frames=64,
-        preview_fps=8,
+        preview_fps=24,
         max_resolution=512,
         every_n_steps=1,
         upscale_method="nearest-exact",
@@ -175,7 +203,7 @@ def test_send_skips_broadcast(pkg):
         wrapper = pkg._H3PreviewWrapper(
             node_id="7",
             preview_frames=1,
-            preview_fps=8,
+            preview_fps=24,
             max_resolution=64,
             every_n_steps=1,
             upscale_method="nearest-exact",
@@ -272,6 +300,7 @@ def main():
         test_worker_shutdown_when_full(pkg)
         test_worker_close_hook_after_inflight(pkg)
         test_encode_paths(pkg)
+        test_content_fps_scaling(pkg)
         test_pixel_budget(pkg)
         test_send_skips_broadcast(pkg)
         test_cpu_vae_process_output_contract(pkg)

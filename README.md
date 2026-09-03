@@ -78,7 +78,7 @@ samples evenly across all of them, so the preview is the whole clip, not just th
 | input | default | what it does |
 |---|---|---|
 | `preview_frames` | 8 | latent frames per preview. `1` = a still JPEG; `>1` = animated |
-| `preview_fps` | 8 | playback rate of the animation |
+| `preview_fps` | 24 | content-timeline rate. H3 is authored at 24 fps, so `24` = realtime, `12` = half-speed. Encoder fps is scaled from how densely `preview_frames` samples the latent clip |
 | `max_resolution` | 512 | longest side of the transmitted preview; `0` = native latent size |
 | `every_n_steps` | 1 | throttle. The final step always emits |
 | `upscale_method` | `nearest-exact` | `nearest-exact` / `lanczos` / `bilinear` |

@@ -63,6 +63,11 @@ _RESAMPLE = {
 # normal workflows, but old workflows can still carry arbitrary values.
 _MAX_PREVIEW_PIXELS = 64 * 512 * 512
 
+# H3's EmptyMiniMaxH3LatentAV / task nodes are authored on a 24 fps pixel timeline.
+# Latent tokens are not 1:1 with pixels: FRAME_PER_TOKEN cycles (1, 4, 4, 4, 4).
+_H3_CONTENT_FPS = 24
+_H3_FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+
 
 def _bounded_int(value, default, minimum, maximum):
     """Convert an untrusted/legacy workflow value into a bounded integer."""
@@ -71,6 +76,43 @@ def _bounded_int(value, default, minimum, maximum):
     except (TypeError, ValueError, OverflowError):
         value = default
     return min(maximum, max(minimum, value))
+
+
+def _pixel_frames_for_latent_t(latent_t):
+    """Pixel-frame span covered by ``latent_t`` H3 video latent tokens."""
+    try:
+        latent_t = int(latent_t)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if latent_t <= 0:
+        return 0
+    return sum(_H3_FRAME_PER_TOKEN[i % 5] for i in range(latent_t))
+
+
+def _encode_fps(content_fps, preview_frame_count, pixel_frame_count):
+    """Convert a content-timeline fps (24 = realtime) into an encoder fps.
+
+    Preview payloads only carry a subsample of latent tokens. Playing those
+    tokens at the content fps makes the clip appear fast-forwarded; scale so
+    ``content_fps == 24`` spans the same duration as the underlying pixel clip.
+    """
+    content_fps = _bounded_int(content_fps, _H3_CONTENT_FPS, 1, 60)
+    try:
+        preview_frame_count = int(preview_frame_count)
+    except (TypeError, ValueError, OverflowError):
+        preview_frame_count = 1
+    try:
+        pixel_frame_count = int(pixel_frame_count)
+    except (TypeError, ValueError, OverflowError):
+        pixel_frame_count = 0
+    if preview_frame_count <= 1:
+        return content_fps
+    if pixel_frame_count <= 0:
+        # Fallback when the latent length is unknown: treat the widget as a
+        # direct encode rate (legacy behaviour).
+        return content_fps
+    rate = preview_frame_count * float(content_fps) / float(pixel_frame_count)
+    return max(1, min(60, int(round(rate))))
 
 
 # --------------------------------------------------------------------------------------
@@ -511,7 +553,7 @@ class _H3PreviewWrapper:
         # Schema validation normally enforces these bounds, but wrappers can also
         # be invoked by old/cached workflows or directly by third-party nodes.
         self.preview_frames = _bounded_int(preview_frames, 8, 1, 256)
-        self.preview_fps = _bounded_int(preview_fps, 8, 1, 60)
+        self.preview_fps = _bounded_int(preview_fps, _H3_CONTENT_FPS, 1, 60)
         self.max_resolution = _bounded_int(max_resolution, 512, 0, 4096)
         self.every_n_steps = _bounded_int(every_n_steps, 1, 1, 100)
         self.resample = _RESAMPLE.get(upscale_method, Image.NEAREST)
@@ -544,19 +586,24 @@ class _H3PreviewWrapper:
         except Exception as e:
             logging.warning(f"[MiniMaxH3Preview] send failed: {e}")
 
-    def _frames_to_payload(self, frames, source):
+    def _frames_to_payload(self, frames, source, latent_t=None):
         frames = [_fit(f, self.max_resolution, self.resample) for f in frames]
         if len(frames) > 1:
             pixels = max(1, frames[0].width * frames[0].height)
             allowed = max(1, _MAX_PREVIEW_PIXELS // pixels)
             if allowed < len(frames):
                 frames = [frames[i] for i in _pick_indices(len(frames), allowed)]
-        b64, w, h, mime = _encode_frames(frames, self.preview_fps, self.jpeg_quality)
+        pixel_frames = _pixel_frames_for_latent_t(latent_t) if latent_t is not None else 0
+        encode_fps = _encode_fps(self.preview_fps, len(frames), pixel_frames)
+        b64, w, h, mime = _encode_frames(frames, encode_fps, self.jpeg_quality)
         if not b64:
             return None
         return {
             "image": b64, "mime": mime, "w": w, "h": h, "source": source,
+            # Report the content-timeline fps the user set (24 = realtime), not the
+            # possibly much lower encoder rate used after latent subsampling.
             "fps": self.preview_fps if mime in ("video/mp4", "image/webp") else None,
+            "encode_fps": encode_fps if mime in ("video/mp4", "image/webp") else None,
         }
 
     def _is_h3(self, model_patcher, latent_shapes):
@@ -633,7 +680,7 @@ class _H3PreviewWrapper:
                 s0 = sigmas[0].to(noise.device)
                 video0 = comfy.utils.unpack_latents(noise * s0, latent_shapes)[0]
                 frames0, source0 = _cheap_frames(video0)
-                p = self._frames_to_payload(frames0, source0)
+                p = self._frames_to_payload(frames0, source0, latent_t=video0.shape[2])
                 if p:
                     init.update(p)
         except Exception as e:
@@ -662,10 +709,12 @@ class _H3PreviewWrapper:
 
                     frames, source = _cheap_frames(video)
                     if frames:
+                        latent_t = int(video.shape[2])
                         def _send_cheap(frames=frames, source=source, step_ms=step_ms,
                                         avg_ms=avg_ms, sigma_val=sigma_val,
-                                        sent=step + 1, total=total_steps):
-                            p = self._frames_to_payload(frames, source)
+                                        sent=step + 1, total=total_steps,
+                                        latent_t=latent_t):
+                            p = self._frames_to_payload(frames, source, latent_t=latent_t)
                             if p:
                                 p.update({"step": sent, "total": total, "sigma": sigma_val,
                                           "step_ms": step_ms, "avg_step_ms": avg_ms})
@@ -680,7 +729,9 @@ class _H3PreviewWrapper:
                         # off-thread decode gets to it.
                         z = video[:1].detach().clone()
 
-                        def _send_vae(z=z, sent=step + 1, total=total_steps, sigma_val=sigma_val):
+                        latent_t = int(video.shape[2])
+                        def _send_vae(z=z, sent=step + 1, total=total_steps, sigma_val=sigma_val,
+                                      latent_t=latent_t):
                             t0 = time.perf_counter()
                             try:
                                 vframes = vae_decoder.decode(z)
@@ -691,7 +742,7 @@ class _H3PreviewWrapper:
                                 "[MiniMaxH3Preview] VAE preview: %d frame(s) on %s in %.1fs "
                                 "(step %s/%s)", len(vframes), vae_decoder.device,
                                 time.perf_counter() - t0, sent, total)
-                            p = self._frames_to_payload(vframes, "vae")
+                            p = self._frames_to_payload(vframes, "vae", latent_t=latent_t)
                             if p:
                                 p.update({"step": sent, "total": total, "sigma": sigma_val})
                                 self._send(p, run_id, prompt_id, target_client_id)
@@ -780,8 +831,11 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                             "this if previews start costing sampler time.",
                 ),
                 io.Int.Input(
-                    "preview_fps", default=8, min=1, max=60, step=1,
-                    tooltip="Playback rate of the animated preview. Ignored when preview_frames=1.",
+                    "preview_fps", default=24, min=1, max=60, step=1,
+                    tooltip="Content-timeline playback rate. H3 is authored at 24 fps, so 24 = "
+                            "realtime, 12 = half-speed, 48 = 2x. The encoder rate is scaled from "
+                            "how densely preview_frames samples the latent clip; ignored when "
+                            "preview_frames=1.",
                 ),
                 io.Int.Input(
                     "max_resolution", default=512, min=0, max=4096, step=8,
@@ -860,7 +914,7 @@ class MiniMaxH3LivePreview(io.ComfyNode):
         # Normalize once at the node boundary as well as in the wrapper. This keeps
         # legacy/cached workflows from failing before the wrapper can protect itself.
         preview_frames = _bounded_int(preview_frames, 8, 1, 256)
-        preview_fps = _bounded_int(preview_fps, 8, 1, 60)
+        preview_fps = _bounded_int(preview_fps, _H3_CONTENT_FPS, 1, 60)
         max_resolution = _bounded_int(max_resolution, 512, 0, 4096)
         every_n_steps = _bounded_int(every_n_steps, 1, 1, 100)
         jpeg_quality = _bounded_int(jpeg_quality, 80, 30, 100)

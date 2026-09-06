@@ -313,3 +313,19 @@ is optional and not required to close this hardening pass.
 Plugin-side hardening for the supported live-preview paths is complete, offline-verified, and
 live-accepted for TAE + latent2rgb. Remaining items are host/core limitations or the intentionally
 niche full-VAE option, not open defects in the accepted preview scope.
+
+## Follow-up display/progress pass
+
+The supported preview path now also includes:
+
+- sampler timing and ETA updates on every callback, independent of `every_n_steps` image throttling;
+- latest-pending encode coalescing so a busy encoder does not leave the panel several steps behind;
+- immediate run-boundary events before first-image encoding;
+- status-only pass-through events that clear stale media when the node is attached to a non-H3 model;
+- explicit clip duration/frame metadata for playback;
+- transactional browser media swaps that preserve the last good frame on decode failure;
+- source tabs enabled only after successful media load, with inactive sources paused; and
+- accessible hover/focus playback controls for MP4 and `ImageDecoder`-backed animated WebP.
+
+These additions preserve the existing node schema and event fields; the new media metadata fields
+are optional for compatibility with older queued events.

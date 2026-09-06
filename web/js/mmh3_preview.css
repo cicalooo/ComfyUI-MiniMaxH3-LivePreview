@@ -5,12 +5,12 @@
     height: 100%;
     min-height: 160px;
     box-sizing: border-box;
-    background: #1a1a1a;
-    border: 1px solid #2f2f2f;
-    border-radius: 6px;
+    background: #17191d;
+    border: 1px solid #30343b;
+    border-radius: 7px;
     overflow: hidden;
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    color: #d8d8d8;
+    color: #d8dce4;
 }
 
 .mmh3-header {
@@ -18,18 +18,20 @@
     align-items: center;
     gap: 8px;
     flex: 0 0 auto;
-    padding: 3px 6px;
-    background: #232323;
-    border-bottom: 1px solid #2f2f2f;
+    min-height: 25px;
+    padding: 3px 7px;
+    background: #22252b;
+    border-bottom: 1px solid #30343b;
     font-size: 10px;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: #8a8a8a;
+    color: #969eac;
     user-select: none;
 }
 
 .mmh3-title {
     flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -38,41 +40,46 @@
 .mmh3-tabs {
     display: flex;
     flex: 0 0 auto;
-    gap: 2px;
+    gap: 3px;
 }
 
 .mmh3-tab {
-    padding: 1px 7px;
-    border-radius: 3px;
-    background: #2c2c2c;
-    color: #7a7a7a;
+    min-width: 39px;
+    padding: 2px 7px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: #2c3037;
+    color: #8b93a1;
     cursor: pointer;
+    font: inherit;
     font-size: 9px;
+    line-height: 1.2;
+    text-transform: uppercase;
 }
 
-.mmh3-tab:hover {
-    color: #c8c8c8;
+.mmh3-tab:hover:not(:disabled),
+.mmh3-tab:focus-visible:not(:disabled) {
+    border-color: #6487b5;
+    color: #e4e9f2;
+    outline: none;
 }
 
 .mmh3-tab.active {
     background: #3d6ea8;
-    color: #f0f0f0;
+    color: #f5f8ff;
 }
 
-.mmh3-tab.disabled {
-    opacity: 0.35;
+.mmh3-tab.disabled,
+.mmh3-tab:disabled {
+    opacity: 0.34;
     cursor: default;
-}
-
-.mmh3-tab.disabled:hover {
-    color: #7a7a7a;
 }
 
 .mmh3-stage {
     position: relative;
     flex: 1 1 auto;
     min-height: 60px;
-    background: #101010;
+    background: #0e1014;
     overflow: hidden;
 }
 
@@ -83,24 +90,124 @@
     height: 100%;
     object-fit: contain;
     opacity: 0;
-    transition: opacity 60ms linear;
+    transition: opacity 70ms linear;
     pointer-events: none;
 }
 
-/* Latent-resolution frames are ~84x48; smoothing them into mush helps nobody. */
+.mmh3-canvas {
+    display: block;
+}
+
+/* Latent-resolution frames are tiny; preserving their block structure makes motion legible. */
 .mmh3-root[data-crisp="1"] .mmh3-media {
     image-rendering: pixelated;
 }
 
-.mmh3-placeholder {
+.mmh3-placeholder,
+.mmh3-status {
     position: absolute;
     inset: 0;
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #565656;
+    color: #69717f;
     font-size: 11px;
     pointer-events: none;
+    z-index: 2;
+}
+
+.mmh3-status {
+    inset: 8px 8px auto auto;
+    max-width: calc(100% - 16px);
+    padding: 4px 7px;
+    border: 1px solid rgba(255, 185, 96, 0.3);
+    border-radius: 4px;
+    background: rgba(38, 28, 14, 0.9);
+    color: #f0c27e;
+    font-size: 10px;
+    text-align: right;
+}
+
+.mmh3-status[data-kind="info"] {
+    border-color: rgba(120, 170, 230, 0.3);
+    background: rgba(18, 29, 43, 0.9);
+    color: #a8c7e9;
+}
+
+.mmh3-controls {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: 10px;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 25px;
+    padding: 4px 6px;
+    border: 1px solid rgba(255, 255, 255, 0.13);
+    border-radius: 6px;
+    background: rgba(12, 14, 18, 0.86);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+    opacity: 0;
+    transform: translateY(3px);
+    pointer-events: none;
+    transition: opacity 100ms ease, transform 100ms ease;
+}
+
+.mmh3-stage:hover .mmh3-controls,
+.mmh3-stage:focus-within .mmh3-controls,
+.mmh3-controls[data-playing="0"] {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+
+.mmh3-controls[hidden] {
+    display: none;
+}
+
+.mmh3-status[hidden] {
+    display: none;
+}
+
+.mmh3-play {
+    flex: 0 0 auto;
+    width: 23px;
+    height: 21px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: #3d6ea8;
+    color: #f5f8ff;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 21px;
+}
+
+.mmh3-play:hover,
+.mmh3-play:focus-visible {
+    background: #5288c9;
+    outline: 1px solid #9cc4ef;
+    outline-offset: 1px;
+}
+
+.mmh3-scrubber {
+    flex: 1 1 auto;
+    min-width: 45px;
+    height: 17px;
+    margin: 0;
+    accent-color: #6da2df;
+    cursor: pointer;
+}
+
+.mmh3-playback-time {
+    flex: 0 0 auto;
+    min-width: 67px;
+    color: #cbd3df;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
 }
 
 .mmh3-progress {
@@ -108,31 +215,39 @@
     left: 0;
     right: 0;
     bottom: 0;
+    z-index: 6;
     height: 3px;
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.09);
 }
 
 .mmh3-progress-fill {
     height: 100%;
     width: 0%;
-    background: #3d6ea8;
+    background: #5c91c9;
     transition: width 120ms linear;
 }
 
 .mmh3-footer {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 9px;
     flex: 0 0 auto;
-    padding: 3px 6px;
-    background: #202020;
-    border-top: 1px solid #2f2f2f;
+    min-height: 24px;
+    padding: 3px 7px;
+    background: #202328;
+    border-top: 1px solid #30343b;
     font-size: 10px;
     font-variant-numeric: tabular-nums;
-    color: #9a9a9a;
+    color: #a4acb9;
     white-space: nowrap;
     overflow: hidden;
     user-select: none;
+}
+
+.mmh3-footer > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .mmh3-footer .mmh3-spacer {
@@ -140,12 +255,18 @@
 }
 
 .mmh3-badge {
-    padding: 0 5px;
-    border-radius: 3px;
-    background: #2c2c2c;
-    color: #6f6f6f;
+    flex: 0 0 auto;
+    padding: 2px 5px;
+    border-radius: 4px;
+    background: #2c3037;
+    color: #7f8998;
     font-size: 9px;
     letter-spacing: 0.05em;
+}
+
+.mmh3-badge[data-source="latent"] {
+    background: #39404a;
+    color: #c2cad6;
 }
 
 .mmh3-badge[data-source="tae"] {
@@ -156,4 +277,29 @@
 .mmh3-badge[data-source="vae"] {
     background: #3f5c2c;
     color: #cde8b4;
+}
+
+@media (max-width: 430px) {
+    .mmh3-title,
+    .mmh3-sigma,
+    .mmh3-rate {
+        display: none;
+    }
+
+    .mmh3-footer {
+        gap: 6px;
+    }
+
+    .mmh3-tab {
+        min-width: 34px;
+        padding-inline: 5px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .mmh3-media,
+    .mmh3-controls,
+    .mmh3-progress-fill {
+        transition: none;
+    }
 }

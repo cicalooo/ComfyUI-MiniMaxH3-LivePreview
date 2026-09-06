@@ -231,10 +231,11 @@ def _get_vae_lock(vae):
 
 
 class _Worker:
-    """Single background thread with a bounded drop-on-full queue.
+    """Single background thread with a bounded queue.
 
-    The sampler must never block on preview work, so a full queue drops the job.
-    Shutdown is event based rather than sentinel based: a full queue can no longer
+    The sampler must never block on preview work, so normal submissions drop when
+    full and cheap-preview submissions can replace the stale pending job. Shutdown
+    is event based rather than sentinel based: a full queue can no longer
     prevent the worker from reaching its close hook, which is important for restoring
     a CPU-pinned VAE.
     """
@@ -270,6 +271,32 @@ class _Worker:
                 return True
             except queue.Full:
                 return False
+
+    def submit_latest(self, fn):
+        """Queue ``fn`` while replacing an obsolete pending job when full.
+
+        Cheap previews are snapshots of a moving sampler state. If encoding falls
+        behind, retaining the oldest queued snapshot makes the panel visibly lag
+        behind the generation. This latest-wins variant keeps the active encode,
+        drops one stale pending job, and enqueues the newest snapshot without ever
+        blocking the sampler thread.
+        """
+        with self._state_lock:
+            if self.closed:
+                return False
+            try:
+                self.q.put_nowait(fn)
+                return True
+            except queue.Full:
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.q.put_nowait(fn)
+                    return True
+                except queue.Full:
+                    return False
 
     def _close(self):
         if self.on_close is not None:
@@ -475,6 +502,27 @@ def _encode_frames(frames, fps, quality, pixel_offsets=None, durations_ms=None,
             return b64, w, h, "video/mp4"
     b64, w, h = _encode_animated_webp(frames, fps, quality, durations_ms=durations_ms)
     return b64, w, h, "image/webp"
+
+
+class _StepTiming:
+    """Track sampler callback timing independently from preview throttling."""
+
+    def __init__(self, window_size=8):
+        self.last_time = None
+        self.window = []
+        self.window_size = max(1, int(window_size))
+
+    def tick(self, now=None):
+        now = time.perf_counter() if now is None else float(now)
+        step_ms = None
+        if self.last_time is not None:
+            step_ms = max(0.0, (now - self.last_time) * 1000.0)
+            self.window.append(step_ms)
+            if len(self.window) > self.window_size:
+                self.window.pop(0)
+        self.last_time = now
+        avg_ms = (sum(self.window) / len(self.window)) if self.window else None
+        return step_ms, avg_ms
 
 
 # --------------------------------------------------------------------------------------
@@ -742,7 +790,7 @@ class _H3PreviewWrapper:
         )
         if not b64:
             return None
-        return {
+        payload = {
             "image": b64, "mime": mime, "w": w, "h": h, "source": source,
             # Report the content-timeline fps the user set (24 = realtime), not the
             # possibly much lower average encoder rate after latent subsampling.
@@ -753,6 +801,22 @@ class _H3PreviewWrapper:
                 float(encode_fps) if mime in ("video/mp4", "image/webp") else None
             ),
         }
+        if len(frames) > 1:
+            # Keep the timing contract explicit for the WebP/ImageDecoder player.
+            # MP4 has a native duration too, but these values are useful when the
+            # browser cannot read it immediately and make both transports agree on
+            # the intended H3 pixel-timeline duration.
+            payload["frame_count"] = len(frames)
+            payload["duration_ms"] = int(sum(durations_ms)) if durations_ms else None
+            payload["frame_durations_ms"] = (
+                [max(1, int(round(d))) for d in durations_ms]
+                if durations_ms and len(durations_ms) == len(frames) else None
+            )
+        else:
+            payload["frame_count"] = len(frames)
+            payload["duration_ms"] = None
+            payload["frame_durations_ms"] = None
+        return payload
 
     def _is_h3(self, model_patcher, latent_shapes):
         lf = getattr(model_patcher.model, "latent_format", None)
@@ -769,6 +833,17 @@ class _H3PreviewWrapper:
         model_patcher = executor.class_obj.model_patcher
 
         if not self._is_h3(model_patcher, latent_shapes):
+            # Clear a stale panel when a cached workflow has the node attached to
+            # another model family. This is a status-only event; sampling itself
+            # remains a completely untouched pass-through.
+            run_id = uuid.uuid4().hex
+            context = get_executing_context() if get_executing_context is not None else None
+            prompt_id = getattr(context, "prompt_id", None)
+            prompt_id = str(prompt_id) if prompt_id is not None else None
+            server = getattr(PromptServer, "instance", None) if PromptServer is not None else None
+            target_client_id = getattr(server, "client_id", None) if server is not None else None
+            self._send({"step": 0, "total": 0, "disabled": True},
+                       run_id, prompt_id, target_client_id)
             logging.warning(
                 "[MiniMaxH3Preview] attached to a non-MiniMax-H3 model "
                 f"({type(getattr(model_patcher.model, 'latent_format', None)).__name__}); "
@@ -814,7 +889,10 @@ class _H3PreviewWrapper:
             frames, idx = _latent_to_pil(video, latent_format, self.preview_frames)
             return frames, idx, "latent"
 
-        encoder = _Worker("mmh3_preview_encode", maxsize=2)
+        # Keep one encode in flight and only the newest pending snapshot. A stale
+        # queue is worse than a dropped frame for a live panel because it makes the
+        # display trail the sampler by several steps.
+        encoder = _Worker("mmh3_preview_encode", maxsize=1)
         vae_worker = None
         vae_decoder = None
         if self.vae is not None and self.vae_every_n_steps > 0:
@@ -824,43 +902,57 @@ class _H3PreviewWrapper:
             vae_worker = _Worker("mmh3_preview_vae", maxsize=1, on_close=vae_decoder.restore)
 
         # Boundary-0: seed the panel with the pure-noise latent and the sigma schedule.
+        # Send this before decoding/encoding the first image so the frontend can
+        # reset immediately even when a tiny/full VAE takes noticeable time.
         init = {"step": 0, "total": total_steps_init,
                 "sigma": sigmas_list[0] if sigmas_list else None, "sigmas": sigmas_list}
+        self._send(init, run_id, prompt_id, target_client_id)
         try:
             if sigmas is not None and len(sigmas) > 0:
                 s0 = sigmas[0].to(noise.device)
                 video0 = comfy.utils.unpack_latents(noise * s0, latent_shapes)[0]
                 frames0, idx0, source0 = _cheap_frames(video0)
-                p = self._frames_to_payload(
-                    frames0, source0, latent_t=video0.shape[2], latent_indices=idx0,
-                )
-                if p:
-                    init.update(p)
+                if frames0:
+                    def _send_initial(frames=frames0, source=source0, latent_t=int(video0.shape[2]),
+                                      latent_indices=idx0):
+                        p = self._frames_to_payload(
+                            frames, source, latent_t=latent_t, latent_indices=latent_indices,
+                        )
+                        if p:
+                            p.update({"step": 0, "total": total_steps_init,
+                                      "sigma": sigmas_list[0] if sigmas_list else None})
+                            self._send(p, run_id, prompt_id, target_client_id)
+                    encoder.submit_latest(_send_initial)
         except Exception as e:
             logging.warning(f"[MiniMaxH3Preview] initial noise preview failed: {e}")
-        self._send(init, run_id, prompt_id, target_client_id)
 
-        state = {"last_time": None, "window": []}
+        timing = _StepTiming()
 
         def new_callback(step, x0, x, total_steps):
             try:
                 is_last = step >= total_steps - 1
+                step_ms, avg_ms = timing.tick()
+                sigma_val = sigmas_list[step] if 0 <= step < len(sigmas_list) else None
+
+                # Progress is independent from image throttling. This keeps the
+                # panel's bar and ETA accurate even when every_n_steps is large or
+                # the encode worker is temporarily behind.
+                self._send(
+                    {"step": step + 1, "total": total_steps, "sigma": sigma_val,
+                     "step_ms": step_ms, "avg_step_ms": avg_ms},
+                    run_id, prompt_id, target_client_id,
+                )
                 if step % self.every_n_steps == 0 or is_last:
                     # Never rebind x0 -- the sampler reuses that tensor downstream.
                     video = comfy.utils.unpack_latents(x0, latent_shapes)[0]
 
-                    now = time.perf_counter()
-                    step_ms = None
-                    if state["last_time"] is not None:
-                        step_ms = (now - state["last_time"]) * 1000.0
-                        state["window"].append(step_ms)
-                        if len(state["window"]) > 8:
-                            state["window"].pop(0)
-                    state["last_time"] = now
-                    avg_ms = (sum(state["window"]) / len(state["window"])) if state["window"] else None
-                    sigma_val = sigmas_list[step] if 0 <= step < len(sigmas_list) else None
-
-                    frames, latent_indices, source = _cheap_frames(video)
+                    # Avoid doing a costly TAE decode that will be discarded while
+                    # the single encode worker is already carrying a pending job.
+                    # The final frame is always decoded and submitted.
+                    frames, latent_indices, source = (
+                        _cheap_frames(video)
+                        if is_last or not encoder.q.full() else ([], [], "latent")
+                    )
                     if frames:
                         latent_t = int(video.shape[2])
                         def _send_cheap(frames=frames, source=source, step_ms=step_ms,
@@ -876,9 +968,9 @@ class _H3PreviewWrapper:
                                 p.update({"step": sent, "total": total, "sigma": sigma_val,
                                           "step_ms": step_ms, "avg_step_ms": avg_ms})
                                 self._send(p, run_id, prompt_id, target_client_id)
-                        # The last frame is what the panel is left displaying, so wait for
-                        # a queue slot rather than dropping it. Sampling is over anyway.
-                        encoder.submit(_send_cheap, block_timeout=5.0 if is_last else None)
+                        # Replace any obsolete pending snapshot so the newest frame is
+                        # what the panel is left displaying when sampling ends.
+                        encoder.submit_latest(_send_cheap)
 
                     if vae_decoder is not None and (step % self.vae_every_n_steps == 0 or is_last):
                         device = vae_decoder.resolve(video)
@@ -943,7 +1035,6 @@ class _H3PreviewWrapper:
                     original_callback(step, x0, x, total_steps)
 
         try:
-            state["last_time"] = time.perf_counter()
             return executor(noise, latent_image, sampler, sigmas, denoise_mask,
                             new_callback, disable_pbar, seed, **kwargs)
         finally:

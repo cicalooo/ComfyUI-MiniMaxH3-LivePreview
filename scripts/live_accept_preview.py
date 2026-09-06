@@ -9,8 +9,6 @@ import uuid
 from pathlib import Path
 from urllib import request
 
-import websocket  # websocket-client
-
 
 BASE = "http://127.0.0.1:8188"
 WS_BASE = "ws://127.0.0.1:8188/ws"
@@ -192,6 +190,14 @@ def main():
     ap.add_argument("--tae", default="taeh3.safetensors")
     args = ap.parse_args()
 
+    try:
+        import websocket  # websocket-client
+    except ImportError as exc:  # pragma: no cover - depends on the ComfyUI environment
+        raise SystemExit(
+            "Live acceptance requires websocket-client in the same Python environment "
+            "that runs ComfyUI (pip install websocket-client)."
+        ) from exc
+
     client_id = uuid.uuid4().hex
     prompt = build_prompt(
         unet="10Eros_Max_h3_TURBO-hybrid_beta4_w4a8_final_14gb.safetensors",
@@ -292,13 +298,25 @@ def main():
     prompt_ids = sorted({e.get("prompt_id") for e in events if e.get("prompt_id")})
     steps = [e.get("step") for e in events if e.get("step") is not None]
     mimes = sorted({e.get("mime") for e in events if e.get("mime")})
+    media_events = [e for e in events if e.get("image_b64_len")]
+    # Media events can arrive after a newer progress-only event because encoding is
+    # intentionally asynchronous. Check monotonicity on the lightweight progress
+    # stream itself, not on the interleaved media snapshots.
+    progress_steps = [
+        e.get("step") for e in events
+        if not e.get("image_b64_len") and e.get("total") and e.get("step") is not None
+    ]
+    progress_monotonic = all(a <= b for a, b in zip(progress_steps, progress_steps[1:]))
 
     report = {
-        "ok": done and not errors and len(events) > 0,
+        "ok": done and not errors and bool(media_events) and progress_monotonic,
         "prompt_id": prompt_id,
         "client_id": client_id,
         "elapsed_s": round(time.time() - t0, 2),
         "event_count": len(events),
+        "media_event_count": len(media_events),
+        "progress_steps": progress_steps,
+        "progress_monotonic": progress_monotonic,
         "sources": sources,
         "mimes": mimes,
         "run_ids": run_ids,

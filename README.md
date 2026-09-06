@@ -90,8 +90,17 @@ samples evenly across all of them, so the preview is the whole clip, not just th
 | `vae_decode_device` | `auto` | `auto` / `gpu` / `cpu` |
 | `tae_decoder` | `none` | tiny VAE from `models/vae_approx` — `taeh3.safetensors` replaces latent2rgb with real full-resolution frames |
 
+`every_n_steps` throttles image work only; the sampler progress bar, step timing, and ETA continue
+to update on every callback.
+
 Animated previews are sent as H.264 via NVENC when PyAV exposes it, and as animated WebP otherwise.
 NVENC refuses inputs below 145 × 49, so at `max_resolution=0` the WebP path is the normal one.
+
+Animated previews have a compact playback overlay: hover or focus the panel to reveal play/pause,
+the scrubber, and elapsed/total time. MP4 uses native seeking; animated WebP is decoded with the
+browser's `ImageDecoder` when available. If that API is unavailable, WebP falls back to a frozen
+first frame and remains display-only. The playhead is retained when a newer
+sampler preview arrives, and inactive source tabs are paused to avoid background decode work.
 
 Attaching the node to a non-H3 model is safe: it logs one warning and passes sampling through
 completely untouched.
@@ -136,8 +145,9 @@ first time one lands, then leaves the choice to you.
 
 ## Requirements
 
-ComfyUI with MiniMax H3 support (`comfy/ldm/minimax/`), Pillow, and PyAV. Tested against
-`comfyui-frontend-package==1.51.9` on Windows / RTX 3090.
+ComfyUI with MiniMax H3 support (`comfy/ldm/minimax/`), Pillow, and PyAV. The optional live
+acceptance script also needs `websocket-client`. Tested against `comfyui-frontend-package==1.51.9`
+on Windows / RTX 3090.
 
 ## Verification
 
@@ -147,6 +157,9 @@ Offline hardening checks (no live server required), from the ComfyUI root:
 set PYTHONPATH=%CD%;%CD%\custom_nodes
 python custom_nodes\ComfyUI-MiniMaxH3-LivePreview\scripts\offline_verify.py
 ```
+
+Use the same interpreter that launches ComfyUI; on the bundled Windows checkout this is usually
+`C:\comfycli\.venv\Scripts\python.exe` rather than the system `python`.
 
 Live TAE/latent websocket acceptance (ComfyUI must be running):
 

@@ -121,6 +121,41 @@ def test_worker_close_hook_after_inflight(pkg):
     _ok("worker close hook after in-flight job")
 
 
+def test_worker_latest_wins(pkg):
+    started = threading.Event()
+    release = threading.Event()
+    executed = []
+
+    def blocker():
+        started.set()
+        release.wait(timeout=5)
+        executed.append("active")
+
+    worker = pkg._Worker("mmh3_verify_latest", maxsize=1)
+    assert worker.submit(blocker) is True
+    assert started.wait(timeout=2)
+    assert worker.submit(lambda: executed.append("old")) is True
+    assert worker.submit_latest(lambda: executed.append("middle")) is True
+    assert worker.submit_latest(lambda: executed.append("new")) is True
+    release.set()
+    worker.shutdown(drain_timeout=2, drain=True)
+    worker.thread.join(timeout=2)
+    assert executed == ["active", "new"], executed
+    _ok("latest preview job replaces stale queued work")
+
+
+def test_step_timing(pkg):
+    timing = pkg._StepTiming(window_size=2)
+    assert timing.tick(now=1.0) == (None, None)
+    step_ms, avg_ms = timing.tick(now=1.25)
+    assert abs(step_ms - 250.0) < 1e-6
+    assert abs(avg_ms - 250.0) < 1e-6
+    step_ms, avg_ms = timing.tick(now=1.75)
+    assert abs(step_ms - 500.0) < 1e-6
+    assert abs(avg_ms - 375.0) < 1e-6
+    _ok("sampler timing is independent of preview throttling")
+
+
 def test_encode_paths(pkg):
     frames = [
         Image.new("RGB", (160, 96), color=(i * 20 % 255, 40, 80))
@@ -179,6 +214,9 @@ def test_content_fps_scaling(pkg):
     assert payload["fps"] == 24
     assert abs(payload["encode_fps"] - (8 * 24 / 124)) < 1e-9
     assert payload["mime"] in ("video/mp4", "image/webp")
+    assert payload["frame_count"] == 8
+    assert payload["duration_ms"] == sum(durations_ms)
+    assert payload["frame_durations_ms"] == durations_ms
     raw = base64.b64decode(payload["image"])
     if payload["mime"] == "video/mp4":
         import av
@@ -246,6 +284,36 @@ def test_send_skips_broadcast(pkg):
     finally:
         pkg.PromptServer = old
     _ok("event targeting skips broadcast")
+
+
+def test_non_h3_status_event(pkg):
+    from types import SimpleNamespace
+
+    sent = []
+    wrapper = pkg._H3PreviewWrapper(
+        node_id="9",
+        preview_frames=1,
+        preview_fps=24,
+        max_resolution=64,
+        every_n_steps=1,
+        upscale_method="nearest-exact",
+        jpeg_quality=80,
+        suppress_default=True,
+    )
+    wrapper._send = lambda payload, *args: sent.append(payload)
+
+    class Executor:
+        class_obj = SimpleNamespace(
+            model_patcher=SimpleNamespace(model=SimpleNamespace(latent_format=object()))
+        )
+
+        def __call__(self, *args, **kwargs):
+            return "passthrough"
+
+    result = wrapper(Executor(), None, None, None, None, None, None, False, 0)
+    assert result == "passthrough"
+    assert sent and sent[0]["disabled"] is True
+    _ok("non-H3 pass-through clears stale preview state")
 
 
 def test_latent2rgb_and_tae(pkg):
@@ -322,10 +390,13 @@ def main():
         test_bounds(pkg)
         test_worker_shutdown_when_full(pkg)
         test_worker_close_hook_after_inflight(pkg)
+        test_worker_latest_wins(pkg)
+        test_step_timing(pkg)
         test_encode_paths(pkg)
         test_content_fps_scaling(pkg)
         test_pixel_budget(pkg)
         test_send_skips_broadcast(pkg)
+        test_non_h3_status_event(pkg)
         test_cpu_vae_process_output_contract(pkg)
         test_latent2rgb_and_tae(pkg)
         test_js_syntax()

@@ -4,7 +4,8 @@ A single MODEL-patch node — **MiniMax H3 Live Preview** — that shows the vid
 own node body while H3 samples. Drop it between the H3 model loader and the sampler; nothing else
 to wire.
 
-```
+```<img width="720" height="926" alt="Screen Recording 2026-09-07 020931" src="https://github.com/user-attachments/assets/204251b5-6327-4ced-a060-528aff4f40a6" />
+
 Load Diffusion Model ──▶ MiniMax H3 Live Preview ──▶ (Sol-Attn / Sigma Shift / …) ──▶ KSampler
                                   │
                                   └── preview panel updates every step

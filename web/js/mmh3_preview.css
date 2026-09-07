@@ -126,6 +126,7 @@
     color: #f0c27e;
     font-size: 10px;
     text-align: right;
+    overflow-wrap: anywhere;
 }
 
 .mmh3-status[data-kind="info"] {

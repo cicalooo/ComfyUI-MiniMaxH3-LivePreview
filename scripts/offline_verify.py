@@ -38,7 +38,7 @@ def test_imports_and_schema():
     pkg = importlib.import_module("ComfyUI-MiniMaxH3-LivePreview.preview")
     schema = pkg.MiniMaxH3LivePreview.define_schema()
     assert schema.node_id == "MiniMaxH3LivePreview"
-    assert len(schema.inputs) == 13
+    assert len(schema.inputs) == 14
     assert len(schema.outputs) == 1
     _ok("import + V3 schema")
     return pkg
@@ -61,6 +61,7 @@ def test_bounds(pkg):
         vae_every_n_steps=-1,
         vae_frames=99,
         vae_device="weird",
+        verbose=True,
     )
     assert wrapper.preview_frames == 256
     assert wrapper.preview_fps == 1
@@ -70,6 +71,7 @@ def test_bounds(pkg):
     assert wrapper.vae_every_n_steps == 0
     assert wrapper.vae_frames == 16
     assert wrapper.vae_device == "auto"
+    assert wrapper.verbose is True
     _ok("legacy input bounds")
 
 
@@ -286,6 +288,58 @@ def test_send_skips_broadcast(pkg):
     _ok("event targeting skips broadcast")
 
 
+def test_verbose_error_event(pkg):
+    sent = []
+
+    class FakeServer:
+        def send_sync(self, event, payload, sid=None):
+            sent.append((event, payload, sid))
+
+    class FakePS:
+        instance = FakeServer()
+
+    old = pkg.PromptServer
+    pkg.PromptServer = FakePS
+    try:
+        wrapper = pkg._H3PreviewWrapper(
+            node_id="7",
+            preview_frames=1,
+            preview_fps=24,
+            max_resolution=64,
+            every_n_steps=1,
+            upscale_method="nearest-exact",
+            jpeg_quality=80,
+            suppress_default=True,
+            verbose=True,
+        )
+        wrapper._report_error(
+            "encode", ValueError("codec rejected frame"), run_id="run-1",
+            prompt_id="prompt-1", client_id="client-1", source="latent", step=3,
+            total=8, mime="video/mp4", width=64, height=32,
+        )
+        assert len(sent) == 1
+        event, payload, sid = sent[0]
+        assert event == pkg.EVENT and sid == "client-1"
+        assert payload["verbose"] is True
+        assert payload["run_id"] == "run-1"
+        assert payload["prompt_id"] == "prompt-1"
+        assert payload["step"] == 3 and payload["total"] == 8
+        assert payload["error"] == {
+            "stage": "encode",
+            "type": "ValueError",
+            "message": "codec rejected frame",
+            "source": "latent",
+            "step": 3,
+            "total": 8,
+            "mime": "video/mp4",
+            "w": 64,
+            "h": 32,
+        }
+    finally:
+        pkg.PromptServer = old
+    _ok("verbose preview error event")
+
+
 def test_non_h3_status_event(pkg):
     from types import SimpleNamespace
 
@@ -332,6 +386,12 @@ def test_latent2rgb_and_tae(pkg):
     assert len(frames) == 2 and len(idx) == 2
     # 16x spatial upscale from 10x6 -> 160x96
     assert frames[0].size == (160, 96)
+    try:
+        pkg._latent_to_pil(video, object(), max_frames=2)
+    except ValueError as err:
+        assert "latent_rgb_factors" in str(err)
+    else:
+        raise AssertionError("latent2rgb decode failures must remain observable")
     _ok("latent2rgb + taeh3 decode")
 
 
@@ -379,6 +439,9 @@ def test_cpu_vae_process_output_contract(pkg):
 def test_js_syntax():
     js = ROOT / "web" / "js" / "mmh3_preview.js"
     subprocess.run(["node", "--check", str(js)], check=True)
+    source = js.read_text(encoding="utf-8")
+    assert "enable verbose for details" in source
+    assert "backend preview failure" in source
     _ok("javascript syntax")
 
 
@@ -396,6 +459,7 @@ def main():
         test_content_fps_scaling(pkg)
         test_pixel_budget(pkg)
         test_send_skips_broadcast(pkg)
+        test_verbose_error_event(pkg)
         test_non_h3_status_event(pkg)
         test_cpu_vae_process_output_contract(pkg)
         test_latent2rgb_and_tae(pkg)

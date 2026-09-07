@@ -46,6 +46,7 @@ A latent2rgb preview is inherently at **latent resolution** (`1344 × 768` → `
 | `jpeg_quality` | 80 | transport quality |
 | `suppress_default_preview` | true | stop the sampler node rendering its own preview too |
 | `tae_decoder` | `none` | tiny VAE from `models/vae_approx` — `taeh3.safetensors` replaces latent2rgb |
+| `verbose` | false | include correlated preview failure details in the ComfyUI log and browser console |
 
 `every_n_steps` throttles image work only; the sampler progress bar, step timing, and ETA continue to update on every callback.
 
@@ -111,6 +112,9 @@ Live TAE/latent websocket acceptance (ComfyUI must be running):
 ```bat
 python custom_nodes\ComfyUI-MiniMaxH3-LivePreview\scripts\live_accept_preview.py
 ```
+
+Add `--verbose` when collecting a failure report; it enables correlated backend tracebacks and
+browser-console diagnostics for the preview node.
 
 Accepted scope is **TAE + latent2rgb**. Full video-VAE live preview is a niche optional path and not part of normal acceptance.
 

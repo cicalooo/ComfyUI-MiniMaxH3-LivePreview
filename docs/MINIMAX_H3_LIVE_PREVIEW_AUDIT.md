@@ -176,7 +176,7 @@ The following checks passed against the installed checkout:
 - Plugin import through a package-style import specification.
 - V3 schema generation:
   - node id: `MiniMaxH3LivePreview`
-  - inputs: 13
+  - inputs: 14
   - outputs: 1
 - Tiny TAE checkpoint discovery/load smoke test using the installed
   `models\vae_approx\taeh3.safetensors`:

@@ -30,6 +30,7 @@ def build_prompt(
     length: int,
     steps: int,
     seed: int,
+    verbose: bool,
 ) -> dict:
     # Graph:
     # CLIPLoader -> ClipProjApply -> MiniMaxH3ReferenceToVideo
@@ -73,6 +74,7 @@ def build_prompt(
                 "vae_decode_frames": 1,
                 "vae_decode_device": "auto",
                 "tae_decoder": tae_decoder,
+                "verbose": verbose,
             },
         },
         "5": {
@@ -188,6 +190,10 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--tae", default="taeh3.safetensors")
+    ap.add_argument(
+        "--verbose", action="store_true",
+        help="request correlated preview failure diagnostics in the server log and browser console",
+    )
     args = ap.parse_args()
 
     try:
@@ -212,6 +218,7 @@ def main():
         length=args.length,
         steps=args.steps,
         seed=args.seed,
+        verbose=args.verbose,
     )
 
     # Validate first.
@@ -330,6 +337,7 @@ def main():
             "length": args.length,
             "steps": args.steps,
             "tae_decoder": args.tae,
+            "verbose": args.verbose,
         },
     }
     OUT.write_text(json.dumps(report, indent=2), encoding="utf-8")

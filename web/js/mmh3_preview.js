@@ -99,6 +99,21 @@ function fmtPlaybackTime(seconds) {
     return `${minutes}:${String(whole % 60).padStart(2, "0")}`;
 }
 
+function errorMessage(err) {
+    if (err == null) return "unknown error";
+    const message = typeof err === "string" ? err : err.message;
+    const name = typeof err === "object" ? err.name : "";
+    if (message && name && name !== "Error") return `${name}: ${message}`;
+    return String(message || err);
+}
+
+function errorWithContext(message, cause) {
+    const error = new Error(String(message));
+    if (cause?.name && cause.name !== "Error") error.name = cause.name;
+    error.cause = cause;
+    return error;
+}
+
 api.addEventListener(EVENT, (e) => {
     const data = e.detail;
     if (!data || data.node_id == null) return;
@@ -152,8 +167,10 @@ function createSlot(stage) {
         try { stateCallback(); } catch (_) { /* UI observers must not break playback */ }
     }
 
-    function reportError(err) {
-        try { errorCallback(err instanceof Error ? err : new Error(String(err))); } catch (_) {}
+    function reportError(err, details = {}) {
+        try {
+            errorCallback(err instanceof Error ? err : new Error(String(err)), details);
+        } catch (_) {}
     }
 
     function clamp01(value) {
@@ -271,7 +288,7 @@ function createSlot(stage) {
             return { frames, durations };
         } catch (err) {
             closeFrames(frames);
-            return null;
+            return { error: err instanceof Error ? err : new Error(String(err)) };
         } finally {
             try { decoder?.close?.(); } catch (_) {}
         }
@@ -318,7 +335,14 @@ function createSlot(stage) {
             };
             const onLoaded = () => video.videoWidth > 0 && video.videoHeight > 0
                 ? finish() : undefined;
-            const onError = () => finish(new Error("preview video failed to decode"));
+            const onError = () => {
+                const mediaError = video.error;
+                const code = Number(mediaError?.code);
+                const nativeMessage = mediaError?.message ? `: ${mediaError.message}` : "";
+                finish(new Error(
+                    `preview video failed to decode${Number.isFinite(code) ? ` (MediaError ${code})` : ""}${nativeMessage}`,
+                ));
+            };
             const timer = setTimeout(() => finish(new Error("preview video decode timed out")), 3000);
             video.addEventListener("loadeddata", onLoaded, { once: true });
             video.addEventListener("canplay", onLoaded, { once: true });
@@ -326,11 +350,19 @@ function createSlot(stage) {
         });
     }
 
-    async function loadImage(image) {
+    async function loadImage(image, decoderError = null) {
+        let decodeError = decoderError;
         if (image.decode) {
-            try { await image.decode(); } catch (_) { /* load/error below gives the final verdict */ }
+            try { await image.decode(); } catch (err) { decodeError = err; }
         }
-        await waitForImage(image);
+        try {
+            await waitForImage(image);
+        } catch (err) {
+            if (!decodeError) throw err;
+            throw errorWithContext(
+                `${errorMessage(err)} (ImageDecoder: ${errorMessage(decodeError)})`, err,
+            );
+        }
     }
 
     function freezeImageToCanvas(image) {
@@ -420,7 +452,8 @@ function createSlot(stage) {
                         kind = "video";
                     } else if (job.mime === "image/webp") {
                         const decoded = await decodeAnimatedWebp(blob, job.meta?.frame_durations_ms);
-                        if (decoded) {
+                        const animatedDecodeError = decoded?.error || null;
+                        if (decoded?.frames) {
                             candidateFrames = decoded.frames;
                             durations = decoded.durations;
                             elem = canvas;
@@ -428,7 +461,7 @@ function createSlot(stage) {
                         } else {
                             const image = imgs[imgIdx ^= 1];
                             image.src = nextUrl;
-                            await loadImage(image);
+                            await loadImage(image, animatedDecodeError);
                             if (freezeImageToCanvas(image)) {
                                 elem = canvas;
                                 kind = "image";
@@ -455,7 +488,11 @@ function createSlot(stage) {
                 } catch (err) {
                     closeFrames(candidateFrames);
                     if (nextUrl) URL.revokeObjectURL(nextUrl);
-                    reportError(err);
+                    reportError(err, {
+                        stage: "render",
+                        mime: job.mime,
+                        meta: job.meta || {},
+                    });
                     job.resolve(false);
                 }
             }
@@ -726,6 +763,7 @@ app.registerExtension({
             const available = { latent: false, tae: false, vae: false };
             let userPinned = false;   // user clicked a tab: stop auto-switching
             let controlsRaf = null;
+            let verboseEnabled = false;
 
             function reportStatus(message, isError = false) {
                 status.textContent = message;
@@ -822,11 +860,28 @@ app.registerExtension({
                         syncPlaybackControls();
                     }
                 });
-                slots[s].setErrorCallback((err) => {
+                slots[s].setErrorCallback((err, details = {}) => {
                     if (s === current || !current) {
+                        const reason = errorMessage(err);
+                        const stage = details.stage || "render";
+                        const suffix = verboseEnabled
+                            ? `: ${reason}`
+                            : `; enable verbose for details`;
                         reportStatus(current
-                            ? `preview decode failed — showing the previous frame`
-                            : `preview decode failed`, true);
+                            ? `preview failed during ${stage} — showing the previous frame${suffix}`
+                            : `preview failed during ${stage}${suffix}`, true);
+                        const diagnostic = {
+                            source: s,
+                            stage,
+                            message: reason,
+                            stack: verboseEnabled ? err?.stack : undefined,
+                            mime: details.mime,
+                            meta: details.meta,
+                            run_id: activeRunId,
+                            prompt_id: activePromptId,
+                        };
+                        if (verboseEnabled) console.error("[MiniMaxH3Preview] preview failure", diagnostic, err);
+                        else console.warn("[MiniMaxH3Preview] preview failure", diagnostic);
                     }
                 });
             }
@@ -850,9 +905,10 @@ app.registerExtension({
             let lastProgressStep = -1;
             const latestMediaStep = { latent: -1, tae: -1, vae: -1 };
 
-            function beginRun(runId, promptId) {
+            function beginRun(runId, promptId, verbose = false) {
                 activeRunId = runId;
                 activePromptId = promptId;
+                verboseEnabled = Boolean(verbose);
                 lastProgressStep = -1;
                 userPinned = false;
                 current = null;
@@ -902,7 +958,7 @@ app.registerExtension({
                 );
                 if (startsRun) {
                     if (executionActive && frontendPromptId && promptId && promptId !== frontendPromptId) return;
-                    beginRun(runId, promptId);
+                    beginRun(runId, promptId, data.verbose);
                 } else {
                     if (activePromptId && promptId && promptId !== activePromptId) return;
                     if (runId && activeRunId && runId !== activeRunId) return;
@@ -910,6 +966,7 @@ app.registerExtension({
                     if (runId && !activeRunId) activeRunId = runId;
                     if (promptId && !activePromptId) activePromptId = promptId;
                 }
+                if (typeof data.verbose === "boolean") verboseEnabled = data.verbose;
                 if (data.disabled) {
                     reportStatus("not a MiniMax H3 model", true);
                     placeholder.style.display = "flex";
@@ -934,6 +991,27 @@ app.registerExtension({
                             : "—";
                         rateEl.textContent = `${fmtStepTime(data.avg_step_ms)} · eta ${eta}`;
                     }
+                }
+
+                if (data.error) {
+                    const error = data.error;
+                    const stage = error.stage || "preview";
+                    const reason = error.message || error.type || "unknown error";
+                    const suffix = verboseEnabled
+                        ? `: ${error.type ? `${error.type}: ` : ""}${reason}`
+                        : `; enable verbose for details`;
+                    reportStatus(`preview failed during ${stage}${suffix}`, true);
+                    const diagnostic = {
+                        ...error,
+                        run_id: activeRunId,
+                        prompt_id: activePromptId,
+                        node_id: data.node_id,
+                    };
+                    if (verboseEnabled) console.error("[MiniMaxH3Preview] backend preview failure", diagnostic);
+                    else console.warn("[MiniMaxH3Preview] backend preview failure", diagnostic);
+                    placeholder.style.display = "flex";
+                    placeholder.textContent = `preview failed during ${stage}`;
+                    return;
                 }
 
                 if (!data.image) return;

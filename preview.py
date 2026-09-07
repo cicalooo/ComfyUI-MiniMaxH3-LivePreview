@@ -240,13 +240,14 @@ class _Worker:
     a CPU-pinned VAE.
     """
 
-    def __init__(self, name, maxsize, on_close=None):
+    def __init__(self, name, maxsize, on_close=None, on_error=None):
         self.q = queue.Queue(maxsize=max(1, int(maxsize)))
         self.closed = False
         self._stopping = threading.Event()
         self._drain_on_stop = True
         self._state_lock = threading.Lock()
         self.on_close = on_close
+        self.on_error = on_error
         self.thread = threading.Thread(target=self._run, name=name, daemon=True)
         self.thread.start()
 
@@ -320,8 +321,14 @@ class _Worker:
                 return
             try:
                 item()
-            except Exception:
-                logging.exception("[MiniMaxH3Preview] worker error")
+            except Exception as exc:
+                if self.on_error is not None:
+                    try:
+                        self.on_error(exc)
+                    except Exception:
+                        logging.exception("[MiniMaxH3Preview] worker error callback failed")
+                else:
+                    logging.exception("[MiniMaxH3Preview] worker error")
 
             # submit() is closed before shutdown clears the queue, so an empty queue
             # here is a stable indication that all drainable work has finished.
@@ -543,10 +550,10 @@ def _latent_to_pil(video, latent_format, max_frames):
     place each sample on the H3 pixel timeline.
     """
     if video is None or video.ndim != 5:
-        return [], []
+        raise ValueError("latent2rgb preview expects a 5D video latent")
     factors = getattr(latent_format, "latent_rgb_factors", None)
     if factors is None:
-        return [], []
+        raise ValueError("latent format has no latent_rgb_factors")
     try:
         reshape = getattr(latent_format, "latent_rgb_factors_reshape", None)
         if reshape is not None:
@@ -564,8 +571,7 @@ def _latent_to_pil(video, latent_format, max_frames):
         rgb = rgb.add_(1.0).mul_(127.5).clamp_(0, 255).to(torch.uint8).cpu().numpy()
         return [Image.fromarray(rgb[i]) for i in range(rgb.shape[0])], list(idx)
     except Exception as e:
-        logging.warning(f"[MiniMaxH3Preview] latent2rgb decode failed: {e}")
-        return [], []
+        raise RuntimeError(f"latent2rgb decode failed: {e}") from e
 
 
 def _tae_to_pil(video, tae, max_frames):
@@ -574,7 +580,7 @@ def _tae_to_pil(video, tae, max_frames):
     Raises on failure so the caller can fall back to latent2rgb for the rest of the run.
     """
     if video is None or video.ndim != 5:
-        return [], []
+        raise ValueError("TAE preview expects a 5D video latent")
     idx = _pick_indices(video.shape[2], max_frames)
     rgb = tae.decode_video(video[:1], idx)              # [T, H, W, 3] in 0..1, on the cpu
     u8 = rgb.mul_(255.0).clamp_(0, 255).to(torch.uint8).numpy()
@@ -721,7 +727,8 @@ def _suppressed_preview_image(self_, preview_format, x0):
 class _H3PreviewWrapper:
     def __init__(self, node_id, preview_frames, preview_fps, max_resolution, every_n_steps,
                  upscale_method, jpeg_quality, suppress_default, tae_decoder=TAE_NONE,
-                 vae=None, vae_every_n_steps=0, vae_frames=1, vae_device="auto"):
+                 vae=None, vae_every_n_steps=0, vae_frames=1, vae_device="auto",
+                 verbose=False):
         self.node_id = str(node_id) if node_id is not None else None
         self.tae_decoder = tae_decoder
         # Schema validation normally enforces these bounds, but wrappers can also
@@ -737,14 +744,17 @@ class _H3PreviewWrapper:
         self.vae_every_n_steps = _bounded_int(vae_every_n_steps, 0, 0, 100)
         self.vae_frames = _bounded_int(vae_frames, 1, 1, 16)
         self.vae_device = vae_device if vae_device in ("auto", "gpu", "cpu") else "auto"
+        self.verbose = bool(verbose)
 
     # -- plumbing ----------------------------------------------------------------------
 
-    def _send(self, payload, run_id=None, prompt_id=None, client_id=None):
+    def _send(self, payload, run_id=None, prompt_id=None, client_id=None,
+              _report_send_failure=True):
         if self.node_id is None or PromptServer is None:
             return
         payload = dict(payload)
         payload["node_id"] = self.node_id
+        payload["verbose"] = self.verbose
         if run_id is not None:
             payload["run_id"] = run_id
         if prompt_id is not None:
@@ -758,7 +768,63 @@ class _H3PreviewWrapper:
                 return
             server.send_sync(EVENT, payload, client_id)
         except Exception as e:
-            logging.warning(f"[MiniMaxH3Preview] send failed: {e}")
+            if _report_send_failure:
+                self._report_error(
+                    "send", e, run_id=run_id, prompt_id=prompt_id, client_id=client_id,
+                )
+            elif self.verbose:
+                logging.error("[MiniMaxH3Preview] diagnostic event send failed: %s", e,
+                              exc_info=True)
+            else:
+                logging.warning("[MiniMaxH3Preview] diagnostic event send failed: %s", e)
+
+    @staticmethod
+    def _exception_message(exc):
+        message = str(exc).strip()
+        return message or type(exc).__name__
+
+    def _report_error(self, stage, exc, *, run_id=None, prompt_id=None, client_id=None,
+                      source=None, step=None, total=None, mime=None, width=None,
+                      height=None, frame_count=None):
+        """Log and optionally send a bounded, correlated preview failure diagnostic."""
+        message = self._exception_message(exc)
+        safe_message = message[:1000]
+        error = {
+            "stage": str(stage),
+            "type": type(exc).__name__,
+            "message": safe_message,
+        }
+        for key, value in (
+            ("source", source), ("step", step), ("total", total), ("mime", mime),
+            ("w", width), ("h", height), ("frame_count", frame_count),
+        ):
+            if value is not None:
+                error[key] = value
+        context = " ".join(
+            f"{key}={value}" for key, value in (
+                ("stage", error["stage"]), ("type", error["type"]),
+                ("source", source), ("step", step), ("mime", mime),
+                ("size", f"{width}x{height}" if width and height else None),
+            ) if value is not None
+        )
+        log_message = f"[MiniMaxH3Preview] preview failed ({context}): {safe_message}"
+        if self.verbose:
+            logging.error(
+                "%s run_id=%s prompt_id=%s",
+                log_message, run_id, prompt_id,
+                exc_info=(type(exc), exc, getattr(exc, "__traceback__", None)),
+            )
+        else:
+            logging.warning(log_message)
+        payload = {"error": error}
+        if step is not None:
+            payload["step"] = step
+        elif run_id is not None:
+            # Boundary-0 lets a diagnostic claim a panel even if its media frame failed.
+            payload["step"] = 0
+        if total is not None:
+            payload["total"] = total
+        self._send(payload, run_id, prompt_id, client_id, _report_send_failure=False)
 
     def _frames_to_payload(self, frames, source, latent_t=None, latent_indices=None):
         frames = [_fit(f, self.max_resolution, self.resample) for f in frames]
@@ -789,7 +855,7 @@ class _H3PreviewWrapper:
             content_fps=self.preview_fps,
         )
         if not b64:
-            return None
+            raise RuntimeError("preview encoder returned no payload")
         payload = {
             "image": b64, "mime": mime, "w": w, "h": h, "source": source,
             # Report the content-timeline fps the user set (24 = realtime), not the
@@ -892,7 +958,15 @@ class _H3PreviewWrapper:
         # Keep one encode in flight and only the newest pending snapshot. A stale
         # queue is worse than a dropped frame for a live panel because it makes the
         # display trail the sampler by several steps.
-        encoder = _Worker("mmh3_preview_encode", maxsize=1)
+        def _encode_worker_error(exc):
+            self._report_error(
+                "encode", exc, run_id=run_id, prompt_id=prompt_id,
+                client_id=target_client_id,
+            )
+
+        encoder = _Worker(
+            "mmh3_preview_encode", maxsize=1, on_error=_encode_worker_error,
+        )
         vae_worker = None
         vae_decoder = None
         if self.vae is not None and self.vae_every_n_steps > 0:
@@ -924,7 +998,10 @@ class _H3PreviewWrapper:
                             self._send(p, run_id, prompt_id, target_client_id)
                     encoder.submit_latest(_send_initial)
         except Exception as e:
-            logging.warning(f"[MiniMaxH3Preview] initial noise preview failed: {e}")
+            self._report_error(
+                "initial_decode", e, run_id=run_id, prompt_id=prompt_id,
+                client_id=target_client_id, step=0, total=total_steps_init,
+            )
 
         timing = _StepTiming()
 
@@ -985,18 +1062,29 @@ class _H3PreviewWrapper:
                             try:
                                 vframes, vidx = vae_decoder.decode(z)
                             except Exception as e:
-                                logging.warning(f"[MiniMaxH3Preview] VAE preview decode failed: {e}")
+                                self._report_error(
+                                    "vae_decode", e, run_id=run_id, prompt_id=prompt_id,
+                                    client_id=target_client_id, source="vae", step=sent,
+                                    total=total,
+                                )
                                 return
-                            logging.info(
-                                "[MiniMaxH3Preview] VAE preview: %d frame(s) on %s in %.1fs "
-                                "(step %s/%s)", len(vframes), vae_decoder.device,
-                                time.perf_counter() - t0, sent, total)
-                            p = self._frames_to_payload(
-                                vframes, "vae", latent_t=latent_t, latent_indices=vidx,
-                            )
-                            if p:
-                                p.update({"step": sent, "total": total, "sigma": sigma_val})
-                                self._send(p, run_id, prompt_id, target_client_id)
+                            try:
+                                logging.info(
+                                    "[MiniMaxH3Preview] VAE preview: %d frame(s) on %s in %.1fs "
+                                    "(step %s/%s)", len(vframes), vae_decoder.device,
+                                    time.perf_counter() - t0, sent, total)
+                                p = self._frames_to_payload(
+                                    vframes, "vae", latent_t=latent_t, latent_indices=vidx,
+                                )
+                                if p:
+                                    p.update({"step": sent, "total": total, "sigma": sigma_val})
+                                    self._send(p, run_id, prompt_id, target_client_id)
+                            except Exception as e:
+                                self._report_error(
+                                    "vae_encode", e, run_id=run_id, prompt_id=prompt_id,
+                                    client_id=target_client_id, source="vae", step=sent,
+                                    total=total,
+                                )
 
 
                         if device == "gpu":
@@ -1007,7 +1095,10 @@ class _H3PreviewWrapper:
                         else:
                             vae_worker.submit(_send_vae)
             except Exception as e:
-                logging.warning(f"[MiniMaxH3Preview] preview callback failed: {e}")
+                self._report_error(
+                    "callback", e, run_id=run_id, prompt_id=prompt_id,
+                    client_id=target_client_id, step=step + 1, total=total_steps,
+                )
             if original_callback is not None:
                 # The stock callback owns the ComfyUI progress bar as well as the
                 # previewer. Suppress only its image result, and only during this
@@ -1150,6 +1241,13 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                             "Put the file in models/vae_approx and select it here: VAELoader "
                             "cannot load it ('VAE is invalid: None').",
                 ),
+                # Appended so existing workflows keep their widget values lined up.
+                io.Boolean.Input(
+                    "verbose", default=False,
+                    tooltip="Include preview stage, exception type, and detailed traceback in the "
+                            "ComfyUI log and browser console when a preview fails. The node always "
+                            "shows a concise failure stage; image payloads and tensors are never logged.",
+                ),
             ],
             outputs=[io.Model.Output(tooltip="Model with the live preview attached.")],
             hidden=[io.Hidden.unique_id],
@@ -1158,9 +1256,9 @@ class MiniMaxH3LivePreview(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, preview_frames, preview_fps, max_resolution, every_n_steps,
-                upscale_method, jpeg_quality, suppress_default_preview,
-                vae=None, vae_decode_every_n_steps=0, vae_decode_frames=1,
-                vae_decode_device="auto", tae_decoder=TAE_NONE) -> io.NodeOutput:
+                 upscale_method, jpeg_quality, suppress_default_preview,
+                 vae=None, vae_decode_every_n_steps=0, vae_decode_frames=1,
+                 vae_decode_device="auto", tae_decoder=TAE_NONE, verbose=False) -> io.NodeOutput:
         # Normalize once at the node boundary as well as in the wrapper. This keeps
         # legacy/cached workflows from failing before the wrapper can protect itself.
         preview_frames = _bounded_int(preview_frames, 8, 1, 256)
@@ -1193,7 +1291,7 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                 cls.hidden.unique_id, preview_frames, preview_fps, max_resolution,
                 every_n_steps, upscale_method, jpeg_quality, suppress_default_preview,
                 tae_decoder, vae, vae_decode_every_n_steps, vae_decode_frames,
-                vae_decode_device,
+                vae_decode_device, verbose,
             ),
         )
         return io.NodeOutput(m)

@@ -15,6 +15,7 @@ H3 is the reason this is not just KJNodes' generic Model Preview Override:
 """
 
 import base64
+from collections import OrderedDict
 import io as pyio
 import logging
 import queue
@@ -43,6 +44,11 @@ except ImportError:
     PromptServer = None
 
 try:
+    from aiohttp import web
+except ImportError:  # pragma: no cover - ComfyUI supplies aiohttp at runtime
+    web = None
+
+try:
     from comfy_execution.utils import get_executing_context
 except ImportError:  # pragma: no cover - compatibility with older ComfyUI builds
     get_executing_context = None
@@ -63,6 +69,13 @@ _RESAMPLE = {
 # Bound the amount of image data held/encoded by one event. Schema limits protect
 # normal workflows, but old workflows can still carry arbitrary values.
 _MAX_PREVIEW_PIXELS = 64 * 512 * 512
+
+# A base64 preview is capped at 32 MiB in the browser.  The corresponding
+# decoded MP4 is at most 24 MiB (32 * 3 / 4, rounded down), which is also the
+# maximum amount accepted by the same-origin fallback endpoint below.
+_MAX_PREVIEW_MEDIA_BYTES = 24 * 1024 * 1024
+_PREVIEW_MEDIA_TTL_SECONDS = 5 * 60
+_PREVIEW_MEDIA_CACHE_BYTES = 128 * 1024 * 1024
 
 # H3's EmptyMiniMaxH3LatentAV / task nodes are authored on a 24 fps pixel timeline.
 # Latent tokens are not 1:1 with pixels: FRAME_PER_TOKEN cycles (1, 4, 4, 4, 4).
@@ -198,6 +211,199 @@ def _preview_timeline(latent_indices, latent_t, content_fps):
 # --------------------------------------------------------------------------------------
 # transport
 # --------------------------------------------------------------------------------------
+
+
+class _PreviewMediaStore:
+    """Bounded in-memory store for same-origin media fallback responses.
+
+    The normal preview transport is a targeted websocket event carrying base64
+    data.  A few browser environments reject ``blob:`` URLs for media elements,
+    so the frontend can copy only the affected MP4 to this short-lived store and
+    load it through ComfyUI's own origin instead.  Entries are immutable after
+    insertion and all bookkeeping is protected because uploads and sampler
+    workers can arrive on different threads.
+    """
+
+    def __init__(self, *, ttl_seconds=_PREVIEW_MEDIA_TTL_SECONDS,
+                 max_bytes=_PREVIEW_MEDIA_CACHE_BYTES):
+        self.ttl_seconds = max(1.0, float(ttl_seconds))
+        self.max_bytes = max(1, int(max_bytes))
+        self._entries = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _now():
+        return time.monotonic()
+
+    def _purge_locked(self, now=None):
+        now = self._now() if now is None else now
+        expired = [
+            token for token, entry in self._entries.items()
+            if entry[1] <= now
+        ]
+        for token in expired:
+            data, _ = self._entries.pop(token)
+            self._bytes -= len(data)
+
+    def put(self, data):
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("preview media must be bytes")
+        data = bytes(data)
+        if not data or len(data) > _MAX_PREVIEW_MEDIA_BYTES:
+            raise ValueError("preview media is missing or too large")
+        if len(data) > self.max_bytes:
+            raise ValueError("preview media exceeds cache capacity")
+        now = self._now()
+        with self._lock:
+            self._purge_locked(now)
+            while self._entries and self._bytes + len(data) > self.max_bytes:
+                _, (old_data, _) = self._entries.popitem(last=False)
+                self._bytes -= len(old_data)
+            token = uuid.uuid4().hex
+            self._entries[token] = (data, now + self.ttl_seconds)
+            self._bytes += len(data)
+            return token
+
+    @staticmethod
+    def _valid_token(token):
+        if not isinstance(token, str) or len(token) != 32:
+            return False
+        return all(char in "0123456789abcdef" for char in token.lower())
+
+    def get(self, token):
+        if not self._valid_token(token):
+            return None
+        now = self._now()
+        with self._lock:
+            self._purge_locked(now)
+            entry = self._entries.get(token.lower())
+            if entry is None:
+                return None
+            data, _ = entry
+            self._entries.move_to_end(token.lower())
+            self._entries[token.lower()] = (data, now + self.ttl_seconds)
+            return data
+
+    def delete(self, token):
+        if not self._valid_token(token):
+            return False
+        with self._lock:
+            entry = self._entries.pop(token.lower(), None)
+            if entry is None:
+                return False
+            self._bytes -= len(entry[0])
+            return True
+
+    def snapshot(self):
+        """Return a small state snapshot for tests and diagnostics."""
+        with self._lock:
+            self._purge_locked()
+            return len(self._entries), self._bytes
+
+
+def _preview_media_range(data, range_header):
+    """Return ``(start, end)`` for one RFC 9110 byte range, or ``None``."""
+    if not range_header:
+        return 0, len(data) - 1
+    if not range_header.lower().startswith("bytes="):
+        return None
+    spec = range_header[6:].split(",", 1)[0].strip()
+    if "-" not in spec:
+        return None
+    start_text, end_text = spec.split("-", 1)
+    try:
+        if not start_text:
+            suffix = int(end_text)
+            if suffix <= 0:
+                return None
+            start = max(0, len(data) - suffix)
+            end = len(data) - 1
+        else:
+            start = int(start_text)
+            end = int(end_text) if end_text else len(data) - 1
+            if start < 0 or start >= len(data) or end < start:
+                return None
+            end = min(end, len(data) - 1)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return start, end
+
+
+def _register_preview_media_routes():
+    """Register the temporary same-origin media fallback routes once per server."""
+    if PromptServer is None or web is None:
+        return
+    server = getattr(PromptServer, "instance", None)
+    routes = getattr(server, "routes", None) if server is not None else None
+    if routes is None or getattr(server, "_mmh3_preview_media_routes", False):
+        return
+
+    store = _PreviewMediaStore()
+    setattr(server, "_mmh3_preview_media_store", store)
+
+    @routes.post("/minimax_h3_preview/media")
+    async def _upload_preview_media(request):
+        content_type = request.headers.get("Content-Type", "")
+        content_type = content_type.split(";", 1)[0].strip().lower()
+        if content_type != "video/mp4":
+            return web.json_response({"error": "video/mp4 is required"}, status=415)
+        try:
+            content_length = request.content_length
+        except (AttributeError, TypeError, ValueError):
+            content_length = None
+        if content_length is not None and content_length > _MAX_PREVIEW_MEDIA_BYTES:
+            return web.json_response({"error": "preview media is too large"}, status=413)
+        try:
+            data = await request.content.read(_MAX_PREVIEW_MEDIA_BYTES + 1)
+            token = store.put(data)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=413)
+        except Exception:
+            logging.exception("[MiniMaxH3Preview] same-origin media upload failed")
+            return web.json_response({"error": "preview media upload failed"}, status=400)
+        return web.json_response({"token": token})
+
+    async def _serve_preview_media(request):
+        token = request.match_info.get("token", "")
+        data = store.get(token)
+        if data is None:
+            return web.json_response({"error": "preview media not found"}, status=404)
+        byte_range = _preview_media_range(data, request.headers.get("Range"))
+        if byte_range is None:
+            return web.Response(
+                status=416,
+                headers={"Content-Range": f"bytes */{len(data)}"},
+            )
+        start, end = byte_range
+        body = data[start:end + 1]
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Type": "video/mp4",
+            "Content-Length": str(len(body)),
+        }
+        if request.headers.get("Range"):
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(data)}"
+        return web.Response(
+            status=206 if request.headers.get("Range") else 200,
+            body=body,
+            headers=headers,
+        )
+
+    @routes.get("/minimax_h3_preview/media/{token}")
+    async def _get_preview_media(request):
+        return await _serve_preview_media(request)
+
+    @routes.delete("/minimax_h3_preview/media/{token}")
+    async def _delete_preview_media(request):
+        store.delete(request.match_info.get("token", ""))
+        return web.Response(status=204)
+
+    setattr(server, "_mmh3_preview_media_routes", True)
+
+
+_register_preview_media_routes()
 
 def _probe_nvenc():
     # PyPI PyAV wheels typically lack NVENC; probe once at import.

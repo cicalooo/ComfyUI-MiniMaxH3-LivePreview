@@ -6,9 +6,11 @@ plugin-side fixes documented in docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib
 import io
+import json
 import subprocess
 import sys
 import threading
@@ -73,6 +75,123 @@ def test_bounds(pkg):
     assert wrapper.vae_device == "auto"
     assert wrapper.verbose is True
     _ok("legacy input bounds")
+
+
+def test_media_fallback_store(pkg):
+    store = pkg._PreviewMediaStore(ttl_seconds=60, max_bytes=6)
+    first = store.put(b"abcd")
+    assert store.get(first) == b"abcd"
+    assert store.snapshot() == (1, 4)
+
+    # The bounded cache evicts the least-recently-used entry before inserting.
+    second = store.put(b"efgh")
+    assert store.get(first) is None
+    assert store.get(second) == b"efgh"
+    assert store.snapshot() == (1, 4)
+    assert store.delete(second) is True
+    assert store.delete(second) is False
+    assert store.snapshot() == (0, 0)
+
+    assert pkg._preview_media_range(b"012345", None) == (0, 5)
+    assert pkg._preview_media_range(b"012345", "bytes=2-4") == (2, 4)
+    assert pkg._preview_media_range(b"012345", "bytes=3-") == (3, 5)
+    assert pkg._preview_media_range(b"012345", "bytes=-2") == (4, 5)
+    assert pkg._preview_media_range(b"012345", "bytes=99-") is None
+    _ok("same-origin media fallback cache + ranges")
+
+
+def test_media_fallback_routes(pkg):
+    if pkg.web is None:
+        raise AssertionError("aiohttp is required for the media fallback routes")
+
+    class FakeRoutes:
+        def __init__(self):
+            self.handlers = {}
+
+        def _register(self, method, path):
+            def decorator(handler):
+                self.handlers[(method, path)] = handler
+                return handler
+            return decorator
+
+        def post(self, path):
+            return self._register("POST", path)
+
+        def get(self, path):
+            return self._register("GET", path)
+
+        def delete(self, path):
+            return self._register("DELETE", path)
+
+    class FakeServer:
+        def __init__(self):
+            self.routes = FakeRoutes()
+
+    class FakePromptServer:
+        instance = FakeServer()
+
+    old_prompt_server = pkg.PromptServer
+    pkg.PromptServer = FakePromptServer
+    try:
+        pkg._register_preview_media_routes()
+        handlers = FakePromptServer.instance.routes.handlers
+        post = handlers[("POST", "/minimax_h3_preview/media")]
+        get = handlers[("GET", "/minimax_h3_preview/media/{token}")]
+        delete = handlers[("DELETE", "/minimax_h3_preview/media/{token}")]
+
+        class Body:
+            def __init__(self, data):
+                self.data = data
+
+            async def read(self, _limit):
+                return self.data
+
+        from types import SimpleNamespace
+
+        response = asyncio.run(post(SimpleNamespace(
+            headers={"Content-Type": "image/jpeg"},
+            content_length=0,
+            content=Body(b""),
+        )))
+        assert response.status == 415
+        response = asyncio.run(post(SimpleNamespace(
+            headers={"Content-Type": "video/mp4"},
+            content_length=pkg._MAX_PREVIEW_MEDIA_BYTES + 1,
+            content=Body(b""),
+        )))
+        assert response.status == 413
+
+        data = b"fake-mp4"
+        request = SimpleNamespace(
+            headers={"Content-Type": "video/mp4"},
+            content_length=len(data),
+            content=Body(data),
+        )
+        response = asyncio.run(post(request))
+        assert response.status == 200
+        token = json.loads(response.text)["token"]
+
+        response = asyncio.run(get(SimpleNamespace(
+            headers={}, match_info={"token": token},
+        )))
+        assert response.status == 200 and response.body == data
+        response = asyncio.run(get(SimpleNamespace(
+            headers={"Range": "bytes=2-5"}, match_info={"token": token},
+        )))
+        assert response.status == 206 and response.body == data[2:6]
+        assert response.headers["Content-Range"] == f"bytes 2-5/{len(data)}"
+
+        response = asyncio.run(delete(SimpleNamespace(
+            match_info={"token": token},
+        )))
+        assert response.status == 204
+        response = asyncio.run(get(SimpleNamespace(
+            headers={}, match_info={"token": token},
+        )))
+        assert response.status == 404
+    finally:
+        pkg.PromptServer = old_prompt_server
+    _ok("same-origin media fallback routes")
 
 
 def test_worker_shutdown_when_full(pkg):
@@ -442,6 +561,8 @@ def test_js_syntax():
     source = js.read_text(encoding="utf-8")
     assert "enable verbose for details" in source
     assert "backend preview failure" in source
+    assert "uploadVideoForSameOriginFallback" in source
+    assert "isUrlSafetyError" in source
     _ok("javascript syntax")
 
 
@@ -451,6 +572,8 @@ def main():
     try:
         pkg = test_imports_and_schema()
         test_bounds(pkg)
+        test_media_fallback_store(pkg)
+        test_media_fallback_routes(pkg)
         test_worker_shutdown_when_full(pkg)
         test_worker_close_hook_after_inflight(pkg)
         test_worker_latest_wins(pkg)

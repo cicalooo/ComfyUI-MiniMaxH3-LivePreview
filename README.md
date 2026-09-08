@@ -50,7 +50,7 @@ A latent2rgb preview is inherently at **latent resolution** (`1344 × 768` → `
 
 `every_n_steps` throttles image work only; the sampler progress bar, step timing, and ETA continue to update on every callback.
 
-Animated previews are sent as H.264 via NVENC when PyAV exposes it, and as animated WebP otherwise. Hover or focus the panel for play/pause, the scrubber, and elapsed/total time. The playhead is retained when a newer preview arrives.
+Animated previews are sent as H.264 via NVENC when PyAV exposes it, and as animated WebP otherwise. If a browser policy rejects the temporary `blob:` video URL, the widget automatically retries that MP4 through a short-lived same-origin URL. Hover or focus the panel for play/pause, the scrubber, and elapsed/total time. The playhead is retained when a newer preview arrives.
 
 Attaching the node to a non-H3 model is safe: it logs one warning and passes sampling through untouched.
 

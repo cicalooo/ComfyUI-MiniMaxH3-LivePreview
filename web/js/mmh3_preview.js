@@ -62,6 +62,7 @@ function findNodeByQualifiedId(rootGraph, qid) {
 const MAX_PREVIEW_B64_CHARS = 32 * 1024 * 1024;
 const MAX_PREVIEW_FRAMES = 256;
 const PREVIEW_MIMES = new Set(["image/jpeg", "image/webp", "video/mp4"]);
+const PREVIEW_MEDIA_PATH = "/minimax_h3_preview/media";
 
 function b64ToBlob(b64, mime) {
     if (!PREVIEW_MIMES.has(mime)) throw new Error("unsupported preview media type");
@@ -78,6 +79,47 @@ function b64ToBlob(b64, mime) {
     const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
     return new Blob([arr], { type: mime });
+}
+
+function isUrlSafetyError(err) {
+    return /url safety check/i.test(errorMessage(err));
+}
+
+async function uploadVideoForSameOriginFallback(blob) {
+    if (!api?.fetchApi || !api?.apiURL) {
+        throw new Error("same-origin preview fallback is unavailable");
+    }
+    const response = await api.fetchApi(PREVIEW_MEDIA_PATH, {
+        method: "POST",
+        headers: { "Content-Type": "video/mp4" },
+        body: blob,
+        cache: "no-store",
+    });
+    if (!response.ok) {
+        throw new Error(`same-origin preview fallback upload failed (HTTP ${response.status})`);
+    }
+    let payload;
+    try {
+        payload = await response.json();
+    } catch (_) {
+        throw new Error("same-origin preview fallback returned invalid JSON");
+    }
+    const token = typeof payload?.token === "string" ? payload.token : "";
+    if (!/^[0-9a-f]{32}$/i.test(token)) {
+        throw new Error("same-origin preview fallback returned an invalid token");
+    }
+    return {
+        token: token.toLowerCase(),
+        url: api.apiURL(`${PREVIEW_MEDIA_PATH}/${encodeURIComponent(token)}`),
+    };
+}
+
+function deleteVideoFallback(token) {
+    if (!token || !api?.fetchApi) return;
+    void api.fetchApi(`${PREVIEW_MEDIA_PATH}/${encodeURIComponent(token)}`, {
+        method: "DELETE",
+        cache: "no-store",
+    }).catch(() => {});
 }
 
 function fmtDuration(seconds) {
@@ -145,6 +187,8 @@ function createSlot(stage) {
     let visible = null;
     let visibleKind = null;
     let currentUrl = null;
+    let currentObjectUrl = null;
+    let currentMediaToken = null;
     let currentMeta = {};
     let active = false;
     let disposed = false;
@@ -160,6 +204,7 @@ function createSlot(stage) {
     let renderRaf = null;
     let stateCallback = () => {};
     let errorCallback = () => {};
+    let diagnosticCallback = () => {};
 
     const mediaElements = [...imgs, ...videos, canvas];
 
@@ -171,6 +216,10 @@ function createSlot(stage) {
         try {
             errorCallback(err instanceof Error ? err : new Error(String(err)), details);
         } catch (_) {}
+    }
+
+    function reportDiagnostic(details = {}) {
+        try { diagnosticCallback(details); } catch (_) {}
     }
 
     function clamp01(value) {
@@ -386,7 +435,8 @@ function createSlot(stage) {
         visible = elem;
     }
 
-    function promote(elem, kind, meta, nextUrl, frames, durations, preservedPos, preservedPlaying) {
+    function promote(elem, kind, meta, nextUrl, nextObjectUrl, nextMediaToken,
+                     frames, durations, preservedPos, preservedPlaying) {
         stopRenderLoop();
         if (visibleKind === "video") {
             for (const video of videos) video.pause();
@@ -397,8 +447,11 @@ function createSlot(stage) {
         clipDurationMs = frameDurations.reduce((sum, value) => sum + value, 0);
         visibleKind = kind;
         currentMeta = { ...meta };
-        const previousUrl = currentUrl;
+        const previousObjectUrl = currentObjectUrl;
+        const previousMediaToken = currentMediaToken;
         currentUrl = nextUrl;
+        currentObjectUrl = nextObjectUrl;
+        currentMediaToken = nextMediaToken;
         visible = elem;
         position = clamp01(preservedPos);
         playingIntent = Boolean(preservedPlaying && isAnimated() && (kind !== "image" || frames == null));
@@ -409,7 +462,8 @@ function createSlot(stage) {
             }
         }
         show(elem);
-        if (previousUrl && previousUrl !== nextUrl) URL.revokeObjectURL(previousUrl);
+        if (previousObjectUrl) URL.revokeObjectURL(previousObjectUrl);
+        deleteVideoFallback(previousMediaToken);
         if (active && playingIntent) {
             if (kind === "video") tryPlay(elem);
             else if (kind === "webp") {
@@ -434,10 +488,14 @@ function createSlot(stage) {
                     continue;
                 }
                 let nextUrl = null;
+                let nextObjectUrl = null;
+                let nextMediaToken = null;
+                let fallbackAttempted = false;
                 let candidateFrames = null;
                 try {
                     const blob = b64ToBlob(job.b64, job.mime);
-                    nextUrl = URL.createObjectURL(blob);
+                    nextObjectUrl = URL.createObjectURL(blob);
+                    nextUrl = nextObjectUrl;
                     const preservedPos = currentUrl ? currentPosition() : 0;
                     const preservedPlaying = currentUrl ? playingIntent : true;
                     let elem;
@@ -448,7 +506,34 @@ function createSlot(stage) {
                         elem.pause();
                         elem.src = nextUrl;
                         elem.load();
-                        await waitForVideo(elem);
+                        try {
+                            await waitForVideo(elem);
+                        } catch (err) {
+                            if (!isUrlSafetyError(err)) throw err;
+                            fallbackAttempted = true;
+                            reportDiagnostic({ status: "attempted", reason: errorMessage(err) });
+                            let fallback;
+                            try {
+                                fallback = await uploadVideoForSameOriginFallback(blob);
+                            } catch (fallbackErr) {
+                                reportDiagnostic({
+                                    status: "failed",
+                                    reason: errorMessage(fallbackErr),
+                                });
+                                throw errorWithContext(
+                                    `${errorMessage(err)}; same-origin fallback failed: ${errorMessage(fallbackErr)}`,
+                                    fallbackErr,
+                                );
+                            }
+                            reportDiagnostic({ status: "succeeded" });
+                            nextMediaToken = fallback.token;
+                            URL.revokeObjectURL(nextObjectUrl);
+                            nextObjectUrl = null;
+                            nextUrl = fallback.url;
+                            elem.src = nextUrl;
+                            elem.load();
+                            await waitForVideo(elem);
+                        }
                         kind = "video";
                     } else if (job.mime === "image/webp") {
                         const decoded = await decodeAnimatedWebp(blob, job.meta?.frame_durations_ms);
@@ -478,20 +563,23 @@ function createSlot(stage) {
                     }
                     if (disposed || job.generation !== generation) {
                         closeFrames(candidateFrames);
-                        URL.revokeObjectURL(nextUrl);
+                        if (nextObjectUrl) URL.revokeObjectURL(nextObjectUrl);
+                        deleteVideoFallback(nextMediaToken);
                         job.resolve(false);
                         continue;
                     }
-                    promote(elem, kind, job.meta || {}, nextUrl, candidateFrames, durations,
-                        preservedPos, preservedPlaying);
+                    promote(elem, kind, job.meta || {}, nextUrl, nextObjectUrl, nextMediaToken,
+                        candidateFrames, durations, preservedPos, preservedPlaying);
                     job.resolve(true);
                 } catch (err) {
                     closeFrames(candidateFrames);
-                    if (nextUrl) URL.revokeObjectURL(nextUrl);
+                    if (nextObjectUrl) URL.revokeObjectURL(nextObjectUrl);
+                    deleteVideoFallback(nextMediaToken);
                     reportError(err, {
                         stage: "render",
                         mime: job.mime,
                         meta: job.meta || {},
+                        fallback: fallbackAttempted,
                     });
                     job.resolve(false);
                 }
@@ -599,6 +687,7 @@ function createSlot(stage) {
         },
         setStateCallback(callback) { stateCallback = callback || (() => {}); },
         setErrorCallback(callback) { errorCallback = callback || (() => {}); },
+        setDiagnosticCallback(callback) { diagnosticCallback = callback || (() => {}); },
         update,
         play,
         pause,
@@ -631,8 +720,11 @@ function createSlot(stage) {
             decodedFrames = null;
             frameDurations = [];
             clipDurationMs = 0;
-            if (currentUrl) URL.revokeObjectURL(currentUrl);
+            if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+            deleteVideoFallback(currentMediaToken);
             currentUrl = null;
+            currentObjectUrl = null;
+            currentMediaToken = null;
             currentMeta = {};
             visible = null;
             visibleKind = null;
@@ -653,8 +745,11 @@ function createSlot(stage) {
             for (const video of videos) video.pause();
             closeFrames(decodedFrames);
             decodedFrames = null;
-            if (currentUrl) URL.revokeObjectURL(currentUrl);
+            if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+            deleteVideoFallback(currentMediaToken);
             currentUrl = null;
+            currentObjectUrl = null;
+            currentMediaToken = null;
             visible = null;
             visibleKind = null;
             for (const e of mediaElements) {
@@ -877,11 +972,22 @@ app.registerExtension({
                             stack: verboseEnabled ? err?.stack : undefined,
                             mime: details.mime,
                             meta: details.meta,
+                            fallback: details.fallback,
                             run_id: activeRunId,
                             prompt_id: activePromptId,
                         };
                         if (verboseEnabled) console.error("[MiniMaxH3Preview] preview failure", diagnostic, err);
                         else console.warn("[MiniMaxH3Preview] preview failure", diagnostic);
+                    }
+                });
+                slots[s].setDiagnosticCallback((diagnostic = {}) => {
+                    if (verboseEnabled) {
+                        console.info("[MiniMaxH3Preview] video URL-safety fallback", {
+                            ...diagnostic,
+                            source: s,
+                            run_id: activeRunId,
+                            prompt_id: activePromptId,
+                        });
                     }
                 });
             }

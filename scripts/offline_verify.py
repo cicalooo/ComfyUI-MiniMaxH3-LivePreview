@@ -360,12 +360,13 @@ def test_pixel_budget(pkg):
         jpeg_quality=80,
         suppress_default=True,
     )
-    # 64 frames at 512x512 would exceed the 64*512*512 budget and must be thinned.
-    frames = [Image.new("RGB", (512, 512), color=(10, 20, 30)) for _ in range(64)]
+    # 80 frames at 512x512 exceed the 64*512*512 budget and must be thinned.
+    frames = [Image.new("RGB", (512, 512), color=(10, 20, 30)) for _ in range(80)]
     payload = wrapper._frames_to_payload(frames, "latent")
     assert payload is not None
     assert payload["source"] == "latent"
     assert payload["mime"] in ("video/mp4", "image/webp", "image/jpeg")
+    assert payload["frame_count"] == 64
     _ok("preview pixel budget")
 
 
@@ -563,6 +564,9 @@ def test_js_syntax():
     assert "backend preview failure" in source
     assert "uploadVideoForSameOriginFallback" in source
     assert "isUrlSafetyError" in source
+    assert "CONTROLS_REFRESH_MS = 250" in source
+    assert "_mmh3ExecutionEnded" in source
+    assert 'video.addEventListener("timeupdate", notify)' not in source
     _ok("javascript syntax")
 
 

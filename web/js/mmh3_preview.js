@@ -61,6 +61,7 @@ function findNodeByQualifiedId(rootGraph, qid) {
 
 const MAX_PREVIEW_B64_CHARS = 32 * 1024 * 1024;
 const MAX_PREVIEW_FRAMES = 256;
+const CONTROLS_REFRESH_MS = 250;
 const PREVIEW_MIMES = new Set(["image/jpeg", "image/webp", "video/mp4"]);
 const PREVIEW_MEDIA_PATH = "/minimax_h3_preview/media";
 
@@ -202,6 +203,7 @@ function createSlot(stage) {
     let playingIntent = false;
     let playbackStart = null;
     let renderRaf = null;
+    let lastDrawnFrame = null;
     let stateCallback = () => {};
     let errorCallback = () => {};
     let diagnosticCallback = () => {};
@@ -286,11 +288,15 @@ function createSlot(stage) {
         if (visibleKind !== "webp" || !canvasCtx) return;
         const frame = frameAtPosition(currentPosition());
         if (!frame) return;
+        if (frame === lastDrawnFrame
+            && canvas.width === frame.displayWidth
+            && canvas.height === frame.displayHeight) return;
         if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
             canvas.width = frame.displayWidth;
             canvas.height = frame.displayHeight;
         }
         canvasCtx.drawImage(frame, 0, 0);
+        lastDrawnFrame = frame;
         canvas.style.opacity = active ? "1" : "0";
     }
 
@@ -443,6 +449,7 @@ function createSlot(stage) {
         }
         closeFrames(decodedFrames);
         decodedFrames = frames || null;
+        lastDrawnFrame = null;
         frameDurations = durations || [];
         clipDurationMs = frameDurations.reduce((sum, value) => sum + value, 0);
         visibleKind = kind;
@@ -656,7 +663,6 @@ function createSlot(stage) {
     }
 
     for (const video of videos) {
-        video.addEventListener("timeupdate", notify);
         video.addEventListener("ended", () => {
             if (video === visible && !video.loop) {
                 playingIntent = false;
@@ -718,6 +724,7 @@ function createSlot(stage) {
             for (const video of videos) video.pause();
             closeFrames(decodedFrames);
             decodedFrames = null;
+            lastDrawnFrame = null;
             frameDurations = [];
             clipDurationMs = 0;
             if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
@@ -745,6 +752,7 @@ function createSlot(stage) {
             for (const video of videos) video.pause();
             closeFrames(decodedFrames);
             decodedFrames = null;
+            lastDrawnFrame = null;
             if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
             deleteVideoFallback(currentMediaToken);
             currentUrl = null;
@@ -759,24 +767,28 @@ function createSlot(stage) {
             }
             stateCallback = () => {};
             errorCallback = () => {};
+            diagnosticCallback = () => {};
         },
     };
 }
 
 let executionActive = false;
 let frontendPromptId = null;
+const previewNodes = new Set();
 api.addEventListener("execution_start", (e) => {
     const data = e.detail || {};
     executionActive = true;
     frontendPromptId = data.prompt_id == null ? null : String(data.prompt_id);
 });
 for (const terminalEvent of ["execution_success", "execution_error", "execution_interrupted"]) {
-    api.addEventListener(terminalEvent, () => {
+    api.addEventListener(terminalEvent, (e) => {
+        const promptId = e.detail?.prompt_id == null ? null : String(e.detail.prompt_id);
         executionActive = false;
         // Drop the prompt gate so a later run can claim the panel even if its
         // boundary-0 event raced ahead of execution_start, or if the browser
         // missed the next start event entirely.
         frontendPromptId = null;
+        for (const node of previewNodes) node._mmh3ExecutionEnded?.(promptId);
     });
 }
 
@@ -788,6 +800,7 @@ app.registerExtension({
         chainCallback(nodeType.prototype, "onNodeCreated", function () {
             ensureStyles();
             const node = this;
+            previewNodes.add(node);
 
             const root = el("div", "mmh3-root");
             root.dataset.crisp = "1";
@@ -857,8 +870,14 @@ app.registerExtension({
             let current = null;
             const available = { latent: false, tae: false, vae: false };
             let userPinned = false;   // user clicked a tab: stop auto-switching
-            let controlsRaf = null;
+            let controlsTimer = null;
             let verboseEnabled = false;
+            let runFinished = false;
+
+            function stopControlsRefresh() {
+                if (controlsTimer != null) clearTimeout(controlsTimer);
+                controlsTimer = null;
+            }
 
             function reportStatus(message, isError = false) {
                 status.textContent = message;
@@ -885,6 +904,7 @@ app.registerExtension({
             function syncPlaybackControls() {
                 const state = selectedState();
                 if (!state || !state.controls) {
+                    stopControlsRefresh();
                     controls.hidden = true;
                     controls.dataset.playing = "0";
                     return;
@@ -897,12 +917,12 @@ app.registerExtension({
                 playbackTime.textContent = `${fmtPlaybackTime(state.position * state.duration)} / ${fmtPlaybackTime(state.duration)}`;
                 scrubber.setAttribute("aria-valuetext", playbackTime.textContent);
                 refreshSelectedFooter();
-                if (state.playing && controlsRaf == null) {
-                    controlsRaf = requestAnimationFrame(() => {
-                        controlsRaf = null;
+                if (state.playing && controlsTimer == null) {
+                    controlsTimer = setTimeout(() => {
+                        controlsTimer = null;
                         syncPlaybackControls();
-                    });
-                }
+                    }, CONTROLS_REFRESH_MS);
+                } else if (!state.playing) stopControlsRefresh();
             }
 
             function select(which) {
@@ -1015,6 +1035,7 @@ app.registerExtension({
                 activeRunId = runId;
                 activePromptId = promptId;
                 verboseEnabled = Boolean(verbose);
+                runFinished = false;
                 lastProgressStep = -1;
                 userPinned = false;
                 current = null;
@@ -1150,15 +1171,25 @@ app.registerExtension({
                         refreshSelectedFooter();
                         syncPlaybackControls();
                     }
+                    if (runFinished) slots[source].pause();
                 });
+            };
+
+            node._mmh3ExecutionEnded = (promptId) => {
+                if (promptId && activePromptId && promptId !== activePromptId) return;
+                runFinished = true;
+                for (const s of SOURCES) slots[s].pause();
+                syncPlaybackControls();
             };
 
             chainCallback(node, "onRemoved", function () {
                 document.removeEventListener("visibilitychange", onVisibilityChange);
                 rootObserver?.disconnect?.();
-                if (controlsRaf != null) cancelAnimationFrame(controlsRaf);
+                stopControlsRefresh();
                 for (const s of SOURCES) slots[s].dispose();
+                previewNodes.delete(node);
                 delete node._mmh3Handler;
+                delete node._mmh3ExecutionEnded;
             });
 
             const widget = node.addDOMWidget("preview", "mmh3_preview", root, {

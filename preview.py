@@ -1033,7 +1033,9 @@ class _H3PreviewWrapper:
         self._send(payload, run_id, prompt_id, client_id, _report_send_failure=False)
 
     def _frames_to_payload(self, frames, source, latent_t=None, latent_indices=None):
-        frames = [_fit(f, self.max_resolution, self.resample) for f in frames]
+        frames = list(frames)
+        if not frames:
+            raise RuntimeError("preview encoder received no frames")
         if latent_indices is None:
             latent_indices = list(range(len(frames)))
         else:
@@ -1043,13 +1045,19 @@ class _H3PreviewWrapper:
                 latent_indices = list(range(len(frames)))
         if len(latent_indices) != len(frames):
             latent_indices = list(range(len(frames)))
+
+        fitted_first = _fit(frames[0], self.max_resolution, self.resample)
+        keep = list(range(len(frames)))
         if len(frames) > 1:
-            pixels = max(1, frames[0].width * frames[0].height)
+            pixels = max(1, fitted_first.width * fitted_first.height)
             allowed = max(1, _MAX_PREVIEW_PIXELS // pixels)
             if allowed < len(frames):
                 keep = _pick_indices(len(frames), allowed)
-                frames = [frames[i] for i in keep]
-                latent_indices = [latent_indices[i] for i in keep]
+        frames = [
+            fitted_first if i == 0 else _fit(frames[i], self.max_resolution, self.resample)
+            for i in keep
+        ]
+        latent_indices = [latent_indices[i] for i in keep]
         pixel_offsets, durations_ms, encode_fps, pixel_frames = _preview_timeline(
             latent_indices, latent_t, self.preview_fps,
         )

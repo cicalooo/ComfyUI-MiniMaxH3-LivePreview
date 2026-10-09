@@ -92,6 +92,92 @@ def _bounded_int(value, default, minimum, maximum):
     return min(maximum, max(minimum, value))
 
 
+def _bounded_float(value, default, minimum, maximum):
+    """Convert an untrusted/legacy workflow value into a bounded float."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _is_oom(exc):
+    """Whether an exception looks like a CUDA/VRAM out-of-memory."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    try:
+        message = str(exc).lower()
+    except Exception:
+        return False
+    return "out of memory" in message or "cuda out of memory" in message
+
+
+_BLEH_CONFLICT_WARNED = False
+
+
+def _check_bleh_conflict():
+    """Warn once if ComfyUI-bleh would also try to preview H3.
+
+    Bleh expects madebyollin taeh3.pth (decoder.* + TGrow) and crashes with
+    KeyError 'decoder.7.conv.weight' on the Kijai bare taeh3.safetensors this
+    node uses. H3 must be in bleh's blacklist_formats so this node owns it.
+    Returns True when a conflict is likely. Never raises.
+    """
+    global _BLEH_CONFLICT_WARNED
+    if _BLEH_CONFLICT_WARNED:
+        return True
+    try:
+        from pathlib import Path as _Path
+
+        bleh_dir = _Path(__file__).resolve().parents[1] / "ComfyUI-bleh"
+        if not bleh_dir.is_dir():
+            return False
+        cfg = bleh_dir / "blehconfig.yaml"
+        if not cfg.is_file():
+            cfg = bleh_dir / "blehconfig.json"
+        if not cfg.is_file():
+            logging.warning(
+                "[MiniMaxH3Preview] ComfyUI-bleh is installed but has no blehconfig; "
+                "add minimaxh3video/minimaxh3av to previews.blacklist_formats or bleh "
+                "will crash on taeh3.safetensors (decoder.7.conv.weight)."
+            )
+            _BLEH_CONFLICT_WARNED = True
+            return True
+        try:
+            import json as _json
+
+            text = cfg.read_text(encoding="utf-8")
+            if cfg.suffix == ".json":
+                loaded = _json.loads(text)
+            else:
+                try:
+                    import yaml as _yaml  # type: ignore
+
+                    loaded = _yaml.safe_load(text)
+                except ImportError:
+                    loaded = None
+                    for name in ("minimaxh3video", "minimaxh3av"):
+                        if name in text.lower():
+                            loaded = {"previews": {"blacklist_formats": [name]}}
+                            break
+            previews = (loaded or {}).get("previews", {}) if isinstance(loaded, dict) else {}
+            blacklisted = {str(v).lower() for v in previews.get("blacklist_formats", []) or []}
+        except Exception:
+            return False
+        if "minimaxh3video" in blacklisted or "minimaxh3av" in blacklisted:
+            return False
+        logging.warning(
+            "[MiniMaxH3Preview] ComfyUI-bleh is installed and H3 is not blacklisted; "
+            "add minimaxh3video/minimaxh3av to previews.blacklist_formats in "
+            "ComfyUI-bleh/blehconfig.yaml or bleh will crash on taeh3.safetensors "
+            "(decoder.7.conv.weight)."
+        )
+        _BLEH_CONFLICT_WARNED = True
+        return True
+    except Exception:
+        return False
+
+
 def _pixel_frames_for_latent_t(latent_t):
     """Pixel-frame span covered by ``latent_t`` H3 video latent tokens."""
     try:
@@ -330,92 +416,123 @@ def _preview_media_range(data, range_header):
     return start, end
 
 
+_MEDIA_ROUTES_LOCK = threading.RLock()
+
+
 def _register_preview_media_routes():
-    """Register the temporary same-origin media fallback routes once per server."""
+    """Register the temporary same-origin media fallback routes once per server.
+
+    Returns True once the routes exist. Safe (and cheap) to call on every run:
+    at import time ``PromptServer.instance`` may not exist yet, in which case
+    this is a no-op returning False and the sampler wrapper retries it per run.
+    """
     if PromptServer is None or web is None:
-        return
-    server = getattr(PromptServer, "instance", None)
-    routes = getattr(server, "routes", None) if server is not None else None
-    if routes is None or getattr(server, "_mmh3_preview_media_routes", False):
-        return
+        return False
+    with _MEDIA_ROUTES_LOCK:
+        server = getattr(PromptServer, "instance", None)
+        routes = getattr(server, "routes", None) if server is not None else None
+        if routes is None:
+            return False
+        if getattr(server, "_mmh3_preview_media_routes", False):
+            return True
 
-    store = _PreviewMediaStore()
-    setattr(server, "_mmh3_preview_media_store", store)
+        store = _PreviewMediaStore()
+        setattr(server, "_mmh3_preview_media_store", store)
 
-    @routes.post("/minimax_h3_preview/media")
-    async def _upload_preview_media(request):
-        content_type = request.headers.get("Content-Type", "")
-        content_type = content_type.split(";", 1)[0].strip().lower()
-        if content_type != "video/mp4":
-            return web.json_response({"error": "video/mp4 is required"}, status=415)
-        try:
-            content_length = request.content_length
-        except (AttributeError, TypeError, ValueError):
-            content_length = None
-        if content_length is not None and content_length > _MAX_PREVIEW_MEDIA_BYTES:
-            return web.json_response({"error": "preview media is too large"}, status=413)
-        try:
-            data = await request.content.read(_MAX_PREVIEW_MEDIA_BYTES + 1)
-            token = store.put(data)
-        except ValueError as exc:
-            return web.json_response({"error": str(exc)}, status=413)
-        except Exception:
-            logging.exception("[MiniMaxH3Preview] same-origin media upload failed")
-            return web.json_response({"error": "preview media upload failed"}, status=400)
-        return web.json_response({"token": token})
+        @routes.post("/minimax_h3_preview/media")
+        async def _upload_preview_media(request):
+            content_type = request.headers.get("Content-Type", "")
+            content_type = content_type.split(";", 1)[0].strip().lower()
+            if content_type != "video/mp4":
+                return web.json_response({"error": "video/mp4 is required"}, status=415)
+            try:
+                content_length = request.content_length
+            except (AttributeError, TypeError, ValueError):
+                content_length = None
+            if content_length is not None and content_length > _MAX_PREVIEW_MEDIA_BYTES:
+                return web.json_response({"error": "preview media is too large"}, status=413)
+            try:
+                data = await request.content.read(_MAX_PREVIEW_MEDIA_BYTES + 1)
+                token = store.put(data)
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=413)
+            except Exception:
+                logging.exception("[MiniMaxH3Preview] same-origin media upload failed")
+                return web.json_response({"error": "preview media upload failed"}, status=400)
+            return web.json_response({"token": token})
 
-    async def _serve_preview_media(request):
-        token = request.match_info.get("token", "")
-        data = store.get(token)
-        if data is None:
-            return web.json_response({"error": "preview media not found"}, status=404)
-        byte_range = _preview_media_range(data, request.headers.get("Range"))
-        if byte_range is None:
+        async def _serve_preview_media(request):
+            token = request.match_info.get("token", "")
+            data = store.get(token)
+            if data is None:
+                return web.json_response({"error": "preview media not found"}, status=404)
+            byte_range = _preview_media_range(data, request.headers.get("Range"))
+            if byte_range is None:
+                return web.Response(
+                    status=416,
+                    headers={"Content-Range": f"bytes */{len(data)}"},
+                )
+            start, end = byte_range
+            body = data[start:end + 1]
+            headers = {
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-store",
+                "Content-Type": "video/mp4",
+                "Content-Length": str(len(body)),
+            }
+            if request.headers.get("Range"):
+                headers["Content-Range"] = f"bytes {start}-{end}/{len(data)}"
             return web.Response(
-                status=416,
-                headers={"Content-Range": f"bytes */{len(data)}"},
+                status=206 if request.headers.get("Range") else 200,
+                body=body,
+                headers=headers,
             )
-        start, end = byte_range
-        body = data[start:end + 1]
-        headers = {
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-store",
-            "Content-Type": "video/mp4",
-            "Content-Length": str(len(body)),
-        }
-        if request.headers.get("Range"):
-            headers["Content-Range"] = f"bytes {start}-{end}/{len(data)}"
-        return web.Response(
-            status=206 if request.headers.get("Range") else 200,
-            body=body,
-            headers=headers,
-        )
 
-    @routes.get("/minimax_h3_preview/media/{token}")
-    async def _get_preview_media(request):
-        return await _serve_preview_media(request)
+        @routes.get("/minimax_h3_preview/media/{token}")
+        async def _get_preview_media(request):
+            return await _serve_preview_media(request)
 
-    @routes.delete("/minimax_h3_preview/media/{token}")
-    async def _delete_preview_media(request):
-        store.delete(request.match_info.get("token", ""))
-        return web.Response(status=204)
+        @routes.delete("/minimax_h3_preview/media/{token}")
+        async def _delete_preview_media(request):
+            store.delete(request.match_info.get("token", ""))
+            return web.Response(status=204)
 
-    setattr(server, "_mmh3_preview_media_routes", True)
+        setattr(server, "_mmh3_preview_media_routes", True)
+        return True
 
 
 _register_preview_media_routes()
 
-def _probe_nvenc():
-    # PyPI PyAV wheels typically lack NVENC; probe once at import.
-    try:
-        import av  # noqa: F401
-        av.Codec("h264_nvenc", "w")
-        return True
-    except Exception:
-        return False
+_NVENC_PROBE_LOCK = threading.Lock()
+_NVENC_PROBED = False
+_NVENC_CACHED = False
 
 
-_NVENC_AVAILABLE = _probe_nvenc()
+def _nvenc_available():
+    """Whether PyAV exposes an NVENC H.264 encoder. Probed lazily and once.
+
+    Importing ``av`` at module import slows ComfyUI startup for every user --
+    including those who only ever send stills or WebP -- so the probe (and the
+    import itself) is deferred until the first multi-frame encode.
+    """
+    global _NVENC_PROBED, _NVENC_CACHED
+    with _NVENC_PROBE_LOCK:
+        if not _NVENC_PROBED:
+            try:
+                import av  # noqa: F401
+                av.Codec("h264_nvenc", "w")
+                _NVENC_CACHED = True
+            except Exception:
+                _NVENC_CACHED = False
+            _NVENC_PROBED = True
+        return _NVENC_CACHED
+
+
+def __getattr__(name):
+    # Backwards compatibility for anything reading the old import-time flag.
+    if name == "_NVENC_AVAILABLE":
+        return _nvenc_available()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # NVENC H.264 rejects sub-145x49 inputs at avcodec_open2. Latent-resolution frames are
 # routinely smaller than that, so the WebP fallback is the common path at max_resolution=0.
@@ -480,13 +597,13 @@ class _Worker:
                 return False
 
     def submit_latest(self, fn):
-        """Queue ``fn`` while replacing an obsolete pending job when full.
+        """Queue ``fn`` while replacing obsolete pending jobs when full.
 
         Cheap previews are snapshots of a moving sampler state. If encoding falls
         behind, retaining the oldest queued snapshot makes the panel visibly lag
         behind the generation. This latest-wins variant keeps the active encode,
-        drops one stale pending job, and enqueues the newest snapshot without ever
-        blocking the sampler thread.
+        drops every stale pending job, and enqueues the newest snapshot without
+        ever blocking the sampler thread.
         """
         with self._state_lock:
             if self.closed:
@@ -496,7 +613,8 @@ class _Worker:
                 return True
             except queue.Full:
                 try:
-                    self.q.get_nowait()
+                    while True:
+                        self.q.get_nowait()
                 except queue.Empty:
                     pass
                 try:
@@ -704,7 +822,7 @@ def _encode_frames(frames, fps, quality, pixel_offsets=None, durations_ms=None,
     if len(frames) == 1:
         b64, w, h = _encode_jpeg(frames[0], quality)
         return b64, w, h, "image/jpeg"
-    if _NVENC_AVAILABLE:
+    if _nvenc_available():
         b64, w, h = _encode_mp4_nvenc(
             frames, fps,
             pixel_offsets=pixel_offsets,
@@ -748,6 +866,40 @@ def _pick_indices(total, count):
     return np.linspace(0, total - 1, count).round().astype(int).tolist()
 
 
+_RGB_MATRICES_LOCK = threading.Lock()
+_RGB_MATRICES_CACHE = {}
+
+
+def _rgb_matrices(latent_format, device, dtype):
+    """Cached latent2rgb projection matrices for ``latent_format``.
+
+    Rebuilding ``torch.tensor(factors)`` from nested Python lists on every
+    sampler step is pure overhead: the factors are class-level constants. The
+    cache is keyed by the constants objects themselves so sibling format
+    instances share it, and an entry is rebuilt if those objects ever change.
+    Only the cheap ``.to(device, dtype)`` copy happens per step.
+    """
+    factors = getattr(latent_format, "latent_rgb_factors", None)
+    if factors is None:
+        raise ValueError("latent format has no latent_rgb_factors")
+    bias = getattr(latent_format, "latent_rgb_factors_bias", None)
+    key = (id(factors), id(bias) if bias is not None else None)
+    with _RGB_MATRICES_LOCK:
+        entry = _RGB_MATRICES_CACHE.get(key)
+        if entry is None or entry[0] is not factors or entry[1] is not bias:
+            f_cpu = torch.tensor(factors, dtype=torch.float32).transpose(0, 1)
+            b_cpu = (
+                torch.tensor(bias, dtype=torch.float32)
+                if bias is not None else None
+            )
+            entry = (factors, bias, f_cpu, b_cpu)
+            _RGB_MATRICES_CACHE[key] = entry
+    _, _, f_cpu, b_cpu = entry
+    f = f_cpu.to(device=device, dtype=dtype)
+    b = b_cpu.to(device=device, dtype=dtype) if b_cpu is not None else None
+    return f, b
+
+
 def _latent_to_pil(video, latent_format, max_frames):
     """[B, 24, T, h, w] -> (list of PIL frames, latent indices).
 
@@ -757,8 +909,7 @@ def _latent_to_pil(video, latent_format, max_frames):
     """
     if video is None or video.ndim != 5:
         raise ValueError("latent2rgb preview expects a 5D video latent")
-    factors = getattr(latent_format, "latent_rgb_factors", None)
-    if factors is None:
+    if getattr(latent_format, "latent_rgb_factors", None) is None:
         raise ValueError("latent format has no latent_rgb_factors")
     try:
         reshape = getattr(latent_format, "latent_rgb_factors_reshape", None)
@@ -769,9 +920,7 @@ def _latent_to_pil(video, latent_format, max_frames):
         if len(idx) != x.shape[1]:
             x = x[:, idx]
         x = x.movedim(0, -1).float()                    # [T, h, w, C]
-        f = torch.tensor(factors, device=x.device, dtype=x.dtype).transpose(0, 1)
-        bias = getattr(latent_format, "latent_rgb_factors_bias", None)
-        b = torch.tensor(bias, device=x.device, dtype=x.dtype) if bias is not None else None
+        f, b = _rgb_matrices(latent_format, x.device, x.dtype)
         # linear() allocates, so the in-place scaling below never touches the sampler's tensor
         rgb = torch.nn.functional.linear(x, f, bias=b)
         rgb = rgb.add_(1.0).mul_(127.5).clamp_(0, 255).to(torch.uint8).cpu().numpy()
@@ -930,11 +1079,29 @@ def _suppressed_preview_image(self_, preview_format, x0):
     return None
 
 
+def _collect_preview_targets():
+    """LatentPreviewer plus every registered subclass.
+
+    Collected once per sampling run rather than on every sampler step: the walk
+    is small but the callback runs dozens of times per generation, and previewer
+    registrations only change across runs (custom nodes register at startup).
+    """
+    targets = [latent_preview.LatentPreviewer]
+    stack = list(latent_preview.LatentPreviewer.__subclasses__())
+    while stack:
+        cls = stack.pop()
+        targets.append(cls)
+        stack.extend(cls.__subclasses__())
+    return targets
+
+
 class _H3PreviewWrapper:
     def __init__(self, node_id, preview_frames, preview_fps, max_resolution, every_n_steps,
                  upscale_method, jpeg_quality, suppress_default, tae_decoder=TAE_NONE,
                  vae=None, vae_every_n_steps=0, vae_frames=1, vae_device="auto",
-                 verbose=False):
+                 verbose=False, throttle_secs=0.0, tae_device="auto",
+                 tae_dtype="auto", tae_compile=False, skip_upscale_layers=0,
+                 tae_oom_retry=True):
         self.node_id = str(node_id) if node_id is not None else None
         self.tae_decoder = tae_decoder
         # Schema validation normally enforces these bounds, but wrappers can also
@@ -951,6 +1118,12 @@ class _H3PreviewWrapper:
         self.vae_frames = _bounded_int(vae_frames, 1, 1, 16)
         self.vae_device = vae_device if vae_device in ("auto", "gpu", "cpu") else "auto"
         self.verbose = bool(verbose)
+        self.throttle_secs = _bounded_float(throttle_secs, 0.0, 0.0, 60.0)
+        self.tae_device = tae_device if tae_device in ("auto", "gpu", "cpu") else "auto"
+        self.tae_dtype = tae_dtype if tae_dtype in ("auto", "float32", "float16", "bfloat16") else "auto"
+        self.tae_compile = bool(tae_compile)
+        self.skip_upscale_layers = _bounded_int(skip_upscale_layers, 0, 0, 4)
+        self.tae_oom_retry = bool(tae_oom_retry)
 
     # -- plumbing ----------------------------------------------------------------------
 
@@ -1143,9 +1316,26 @@ class _H3PreviewWrapper:
         sigmas_list = sigmas.detach().cpu().tolist() if sigmas is not None else []
         total_steps_init = max(0, len(sigmas_list) - 1)
 
+        # The import-time registration may have run before PromptServer.instance
+        # existed; retry here so the same-origin MP4 fallback is actually up.
+        _register_preview_media_routes()
+        # Previewer registrations only change across runs, so walk the class tree
+        # once here instead of on every sampler step.
+        preview_targets = _collect_preview_targets()
+
         # Held locally, never on self: the wrapper outlives the run (it rides on the model
         # patcher), and a cached decoder would keep its weights on the GPU forever.
-        cheap = {"tae": load_tae_decoder(self.tae_decoder)}
+        cheap = {
+            "tae": load_tae_decoder(
+                self.tae_decoder, device=self.tae_device, dtype=self.tae_dtype,
+                compile=self.tae_compile, skip_upscale_layers=self.skip_upscale_layers,
+            ),
+            "tae_disabled": False,
+            "oom_count": 0,
+        }
+        # Time throttle state: progress events still go out every step, only image
+        # decodes are throttled. The final step always emits.
+        last_image_time = [0.0]
 
         def _cheap_frames(video):
             """-> (frames, latent_indices, source).
@@ -1154,18 +1344,35 @@ class _H3PreviewWrapper:
             thread like latent2rgb does: taeh3 is ~10 MB and a few milliseconds per
             frame, and decoding here keeps it off the encoder thread, which would
             otherwise allocate VRAM concurrently with a forward pass.
+
+            OOM is retried next step (empty cache, keep weights) when tae_oom_retry
+            is set; any other decode error disables the TAE for the rest of the run.
             """
-            tae = cheap["tae"]
+            tae = None if cheap["tae_disabled"] else cheap["tae"]
             if tae is not None:
                 try:
                     frames, idx = _tae_to_pil(video, tae, self.preview_frames)
                     return frames, idx, "tae"
                 except Exception as e:
-                    cheap["tae"] = None
-                    logging.warning(
-                        f"[MiniMaxH3Preview] tiny-VAE decode failed ({e}); falling back to "
-                        "latent2rgb for the rest of this run."
-                    )
+                    if _is_oom(e) and self.tae_oom_retry:
+                        cheap["oom_count"] += 1
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        logging.warning(
+                            "[MiniMaxH3Preview] tiny-VAE decode OOM (%s); falling back to "
+                            "latent2rgb for this step and retrying next step (oom #%d).",
+                            e, cheap["oom_count"],
+                        )
+                    else:
+                        cheap["tae"] = None
+                        cheap["tae_disabled"] = True
+                        logging.warning(
+                            f"[MiniMaxH3Preview] tiny-VAE decode failed ({e}); falling back to "
+                            "latent2rgb for the rest of this run."
+                        )
             frames, idx = _latent_to_pil(video, latent_format, self.preview_frames)
             return frames, idx, "latent"
 
@@ -1234,80 +1441,92 @@ class _H3PreviewWrapper:
                     run_id, prompt_id, target_client_id,
                 )
                 if step % self.every_n_steps == 0 or is_last:
-                    # Never rebind x0 -- the sampler reuses that tensor downstream.
-                    video = comfy.utils.unpack_latents(x0, latent_shapes)[0]
+                    # Time throttle: progress above stays per-step, image decodes do
+                    # not. The final frame always decodes.
+                    now = time.perf_counter()
+                    if (
+                        not is_last
+                        and self.throttle_secs > 0
+                        and last_image_time[0] != 0.0
+                        and (now - last_image_time[0]) < self.throttle_secs
+                    ):
+                        pass
+                    else:
+                        # Never rebind x0 -- the sampler reuses that tensor downstream.
+                        video = comfy.utils.unpack_latents(x0, latent_shapes)[0]
 
-                    # Avoid doing a costly TAE decode that will be discarded while
-                    # the single encode worker is already carrying a pending job.
-                    # The final frame is always decoded and submitted.
-                    frames, latent_indices, source = (
-                        _cheap_frames(video)
-                        if is_last or not encoder.q.full() else ([], [], "latent")
-                    )
-                    if frames:
-                        latent_t = int(video.shape[2])
-                        def _send_cheap(frames=frames, source=source, step_ms=step_ms,
-                                        avg_ms=avg_ms, sigma_val=sigma_val,
-                                        sent=step + 1, total=total_steps,
-                                        latent_t=latent_t,
-                                        latent_indices=latent_indices):
-                            p = self._frames_to_payload(
-                                frames, source, latent_t=latent_t,
-                                latent_indices=latent_indices,
-                            )
-                            if p:
-                                p.update({"step": sent, "total": total, "sigma": sigma_val,
-                                          "step_ms": step_ms, "avg_step_ms": avg_ms})
-                                self._send(p, run_id, prompt_id, target_client_id)
-                        # Replace any obsolete pending snapshot so the newest frame is
-                        # what the panel is left displaying when sampling ends.
-                        encoder.submit_latest(_send_cheap)
-
-                    if vae_decoder is not None and (step % self.vae_every_n_steps == 0 or is_last):
-                        device = vae_decoder.resolve(video)
-                        # Private copy: the sampler's tensor is long gone by the time an
-                        # off-thread decode gets to it.
-                        z = video[:1].detach().clone()
-
-                        latent_t = int(video.shape[2])
-                        def _send_vae(z=z, sent=step + 1, total=total_steps, sigma_val=sigma_val,
-                                      latent_t=latent_t):
-                            t0 = time.perf_counter()
-                            try:
-                                vframes, vidx = vae_decoder.decode(z)
-                            except Exception as e:
-                                self._report_error(
-                                    "vae_decode", e, run_id=run_id, prompt_id=prompt_id,
-                                    client_id=target_client_id, source="vae", step=sent,
-                                    total=total,
-                                )
-                                return
-                            try:
-                                logging.info(
-                                    "[MiniMaxH3Preview] VAE preview: %d frame(s) on %s in %.1fs "
-                                    "(step %s/%s)", len(vframes), vae_decoder.device,
-                                    time.perf_counter() - t0, sent, total)
+                        # Avoid doing a costly TAE decode that will be discarded while
+                        # the single encode worker is already carrying a pending job.
+                        # The final frame is always decoded and submitted.
+                        frames, latent_indices, source = (
+                            _cheap_frames(video)
+                            if is_last or not encoder.q.full() else ([], [], "latent")
+                        )
+                        if frames:
+                            last_image_time[0] = now
+                            latent_t = int(video.shape[2])
+                            def _send_cheap(frames=frames, source=source, step_ms=step_ms,
+                                            avg_ms=avg_ms, sigma_val=sigma_val,
+                                            sent=step + 1, total=total_steps,
+                                            latent_t=latent_t,
+                                            latent_indices=latent_indices):
                                 p = self._frames_to_payload(
-                                    vframes, "vae", latent_t=latent_t, latent_indices=vidx,
+                                    frames, source, latent_t=latent_t,
+                                    latent_indices=latent_indices,
                                 )
                                 if p:
-                                    p.update({"step": sent, "total": total, "sigma": sigma_val})
+                                    p.update({"step": sent, "total": total, "sigma": sigma_val,
+                                              "step_ms": step_ms, "avg_step_ms": avg_ms})
                                     self._send(p, run_id, prompt_id, target_client_id)
-                            except Exception as e:
-                                self._report_error(
-                                    "vae_encode", e, run_id=run_id, prompt_id=prompt_id,
-                                    client_id=target_client_id, source="vae", step=sent,
-                                    total=total,
-                                )
+                            # Replace any obsolete pending snapshot so the newest frame is
+                            # what the panel is left displaying when sampling ends.
+                            encoder.submit_latest(_send_cheap)
+
+                        if vae_decoder is not None and (step % self.vae_every_n_steps == 0 or is_last):
+                            device = vae_decoder.resolve(video)
+                            # Private copy: the sampler's tensor is long gone by the time an
+                            # off-thread decode gets to it.
+                            z = video[:1].detach().clone()
+
+                            latent_t = int(video.shape[2])
+                            def _send_vae(z=z, sent=step + 1, total=total_steps, sigma_val=sigma_val,
+                                          latent_t=latent_t):
+                                t0 = time.perf_counter()
+                                try:
+                                    vframes, vidx = vae_decoder.decode(z)
+                                except Exception as e:
+                                    self._report_error(
+                                        "vae_decode", e, run_id=run_id, prompt_id=prompt_id,
+                                        client_id=target_client_id, source="vae", step=sent,
+                                        total=total,
+                                    )
+                                    return
+                                try:
+                                    logging.info(
+                                        "[MiniMaxH3Preview] VAE preview: %d frame(s) on %s in %.1fs "
+                                        "(step %s/%s)", len(vframes), vae_decoder.device,
+                                        time.perf_counter() - t0, sent, total)
+                                    p = self._frames_to_payload(
+                                        vframes, "vae", latent_t=latent_t, latent_indices=vidx,
+                                    )
+                                    if p:
+                                        p.update({"step": sent, "total": total, "sigma": sigma_val})
+                                        self._send(p, run_id, prompt_id, target_client_id)
+                                except Exception as e:
+                                    self._report_error(
+                                        "vae_encode", e, run_id=run_id, prompt_id=prompt_id,
+                                        client_id=target_client_id, source="vae", step=sent,
+                                        total=total,
+                                    )
 
 
-                        if device == "gpu":
-                            # Synchronous on purpose: VAE.decode -> load_models_gpu mutates
-                            # global model-management state and could evict the transformer
-                            # from under a concurrent forward pass. This stalls sampling.
-                            _send_vae()
-                        else:
-                            vae_worker.submit(_send_vae)
+                            if device == "gpu":
+                                # Synchronous on purpose: VAE.decode -> load_models_gpu mutates
+                                # global model-management state and could evict the transformer
+                                # from under a concurrent forward pass. This stalls sampling.
+                                _send_vae()
+                            else:
+                                vae_worker.submit(_send_vae)
             except Exception as e:
                 self._report_error(
                     "callback", e, run_id=run_id, prompt_id=prompt_id,
@@ -1321,13 +1540,7 @@ class _H3PreviewWrapper:
                 if self.suppress_default:
                     with _PREVIEW_SUPPRESS_LOCK:
                         prev_methods = []
-                        targets = [latent_preview.LatentPreviewer]
-                        stack = list(latent_preview.LatentPreviewer.__subclasses__())
-                        while stack:
-                            cls = stack.pop()
-                            targets.append(cls)
-                            stack.extend(cls.__subclasses__())
-                        for cls in targets:
+                        for cls in preview_targets:
                             if "decode_latent_to_preview_image" in cls.__dict__:
                                 prev_methods.append((cls, cls.__dict__["decode_latent_to_preview_image"]))
                                 cls.decode_latent_to_preview_image = _suppressed_preview_image
@@ -1408,10 +1621,13 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                     default="nearest-exact",
                     tooltip="Resampling used to scale the preview to max_resolution. "
                             "nearest-exact keeps latent blocks crisp; lanczos smooths them.",
+                    advanced=True,
                 ),
                 io.Int.Input(
                     "jpeg_quality", default=80, min=30, max=100, step=1,
-                    tooltip="Quality for the JPEG/WebP preview transport.",
+                    tooltip="Transport quality for JPEG stills and the animated WebP "
+                            "fallback (NVENC MP4 uses its own rate control).",
+                    advanced=True,
                 ),
                 io.Boolean.Input(
                     "suppress_default_preview", default=True,
@@ -1419,12 +1635,13 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                             "updates. The progress bar still advances normally.",
                 ),
                 io.Vae.Input(
-                    "vae", optional=True,
+                    "vae", optional=True, advanced=True,
                     tooltip="MiniMax H3 *video* VAE, for true full-resolution preview frames. "
                             "Only used when vae_decode_every_n_steps > 0.",
                 ),
                 io.Int.Input(
                     "vae_decode_every_n_steps", default=0, min=0, max=100, step=1,
+                    advanced=True,
                     tooltip="0 = off (recommended). Otherwise run a real VAE decode every N steps. "
                             "COSTLY: the H3 video VAE is ~5.2 GB and does not fit alongside a ~21 GB "
                             "H3 transformer on a 24 GB card, so the GPU path makes ComfyUI evict and "
@@ -1433,11 +1650,13 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "vae_decode_frames", default=1, min=1, max=16, step=1,
+                    advanced=True,
                     tooltip="Full-resolution frames per VAE preview. Each is decoded as an "
                             "independent single-latent-frame slice.",
                 ),
                 io.Combo.Input(
                     "vae_decode_device", options=["auto", "gpu", "cpu"], default="auto",
+                    advanced=True,
                     tooltip="auto compares free VRAM against the VAE's weights plus decode "
                             "activations and picks cpu when they do not fit, logging the numbers.",
                 ),
@@ -1458,9 +1677,50 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                 # Appended so existing workflows keep their widget values lined up.
                 io.Boolean.Input(
                     "verbose", default=False,
+                    advanced=True,
                     tooltip="Include preview stage, exception type, and detailed traceback in the "
                             "ComfyUI log and browser console when a preview fails. The node always "
                             "shows a concise failure stage; image payloads and tensors are never logged.",
+                ),
+                # Appended after verbose so existing workflows keep their widget values.
+                io.Float.Input(
+                    "throttle_secs", default=0.0, min=0.0, max=60.0, step=0.1,
+                    advanced=True,
+                    tooltip="Minimum seconds between image decodes. Progress bar/ETA still "
+                            "update every step; only TAE/latent2rgb image work is throttled. "
+                            "0 = throttle by every_n_steps only. The final step always emits.",
+                ),
+                io.Combo.Input(
+                    "tae_device", options=["auto", "gpu", "cpu"], default="auto",
+                    advanced=True,
+                    tooltip="Device for the tiny TAE decoder. auto honours --cpu-vae via "
+                            "vae_device(); gpu forces CUDA; cpu is slowest but avoids VRAM.",
+                ),
+                io.Combo.Input(
+                    "tae_dtype", options=["auto", "float32", "float16", "bfloat16"],
+                    default="auto",
+                    advanced=True,
+                    tooltip="Dtype for the tiny TAE decoder. auto uses the VAE dtype "
+                            "(fp16/bf16 preferred).",
+                ),
+                io.Boolean.Input(
+                    "tae_compile", default=False,
+                    advanced=True,
+                    tooltip="Compile the tiny TAE with torch.compile. Small first-preview "
+                            "delay, faster per-step decodes. Falls back to eager on failure.",
+                ),
+                io.Int.Input(
+                    "skip_upscale_layers", default=0, min=0, max=4, step=1,
+                    advanced=True,
+                    tooltip="Skip N trailing 2x upsample stages in the tiny TAE (16x -> 8x -> "
+                            "4x -> 2x -> 1x). Faster, smaller previews; 0 = full resolution.",
+                ),
+                io.Boolean.Input(
+                    "tae_oom_retry", default=True,
+                    advanced=True,
+                    tooltip="Retry the tiny TAE next step after an OOM (empty cache, "
+                            "latent2rgb for that step only). Off = disable TAE for the rest "
+                            "of the run on first failure. Non-OOM errors always disable.",
                 ),
             ],
             outputs=[io.Model.Output(tooltip="Model with the live preview attached.")],
@@ -1472,7 +1732,10 @@ class MiniMaxH3LivePreview(io.ComfyNode):
     def execute(cls, model, preview_frames, preview_fps, max_resolution, every_n_steps,
                  upscale_method, jpeg_quality, suppress_default_preview,
                  vae=None, vae_decode_every_n_steps=0, vae_decode_frames=1,
-                 vae_decode_device="auto", tae_decoder=TAE_NONE, verbose=False) -> io.NodeOutput:
+                 vae_decode_device="auto", tae_decoder=TAE_NONE, verbose=False,
+                 throttle_secs=0.0, tae_device="auto", tae_dtype="auto",
+                 tae_compile=False, skip_upscale_layers=0,
+                 tae_oom_retry=True) -> io.NodeOutput:
         # Normalize once at the node boundary as well as in the wrapper. This keeps
         # legacy/cached workflows from failing before the wrapper can protect itself.
         preview_frames = _bounded_int(preview_frames, 8, 1, 256)
@@ -1483,6 +1746,13 @@ class MiniMaxH3LivePreview(io.ComfyNode):
         vae_decode_every_n_steps = _bounded_int(vae_decode_every_n_steps, 0, 0, 100)
         vae_decode_frames = _bounded_int(vae_decode_frames, 1, 1, 16)
         vae_decode_device = vae_decode_device if vae_decode_device in ("auto", "gpu", "cpu") else "auto"
+        throttle_secs = _bounded_float(throttle_secs, 0.0, 0.0, 60.0)
+        tae_device = tae_device if tae_device in ("auto", "gpu", "cpu") else "auto"
+        tae_dtype = tae_dtype if tae_dtype in ("auto", "float32", "float16", "bfloat16") else "auto"
+        tae_compile = bool(tae_compile)
+        skip_upscale_layers = _bounded_int(skip_upscale_layers, 0, 0, 4)
+        tae_oom_retry = bool(tae_oom_retry)
+        _check_bleh_conflict()
         if vae_decode_every_n_steps > 0:
             if vae is None:
                 logging.warning(
@@ -1505,7 +1775,8 @@ class MiniMaxH3LivePreview(io.ComfyNode):
                 cls.hidden.unique_id, preview_frames, preview_fps, max_resolution,
                 every_n_steps, upscale_method, jpeg_quality, suppress_default_preview,
                 tae_decoder, vae, vae_decode_every_n_steps, vae_decode_frames,
-                vae_decode_device, verbose,
+                vae_decode_device, verbose, throttle_secs, tae_device, tae_dtype,
+                tae_compile, skip_upscale_layers, tae_oom_retry,
             ),
         )
         return io.NodeOutput(m)

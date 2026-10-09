@@ -26,6 +26,15 @@ from comfy.taesd.taesd import Block, Clamp, conv
 
 NONE = "none"
 
+TAE_DEVICES = ("auto", "gpu", "cpu")
+TAE_DTYPES = ("auto", "float32", "float16", "bfloat16")
+
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
 
 def list_tae_decoders():
     """vae_approx filenames, with a leading "none" for the disabled state."""
@@ -33,6 +42,43 @@ def list_tae_decoders():
         return [NONE] + folder_paths.get_filename_list("vae_approx")
     except Exception:
         return [NONE]
+
+
+def _resolve_tae_device(device):
+    """Map 'auto'/'gpu'/'cpu'/None/torch.device to a torch.device.
+
+    'auto' honours --cpu-vae and friends via vae_device(). 'gpu' forces the
+    torch device, 'cpu' forces CPU.
+    """
+    if device is None or (isinstance(device, str) and device == "auto"):
+        return comfy.model_management.vae_device()
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, str):
+        name = device.strip().lower()
+        if name == "cpu":
+            return torch.device("cpu")
+        if name in ("gpu", "cuda"):
+            try:
+                return comfy.model_management.get_torch_device()
+            except Exception:
+                return torch.device("cuda")
+        raise ValueError(f"unknown TAE device '{device}' (expected one of {TAE_DEVICES})")
+    raise TypeError(f"bad TAE device type {type(device)}")
+
+
+def _resolve_tae_dtype(dtype, device):
+    """Map 'auto'/None/string/torch.dtype to a torch.dtype."""
+    if dtype is None or (isinstance(dtype, str) and dtype == "auto"):
+        return comfy.model_management.vae_dtype(device, [torch.float16, torch.bfloat16])
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        key = dtype.strip().lower()
+        if key in _DTYPE_MAP:
+            return _DTYPE_MAP[key]
+        raise ValueError(f"unknown TAE dtype '{dtype}' (expected one of {TAE_DTYPES})")
+    raise TypeError(f"bad TAE dtype type {type(dtype)}")
 
 
 def build_tae_decoder(sd):
@@ -74,21 +120,45 @@ class TinyVaeDecoder:
     frame), unlike the real 5.2 GB H3 video VAE.
     """
 
-    def __init__(self, sd, device=None, dtype=None):
+    def __init__(self, sd, device=None, dtype=None, compile=False, skip_upscale_layers=0):
         # keys may carry a "taesd_decoder."/"decoder." prefix; strip whatever is common
         first = next(iter(sd))
         if not first.split(".")[0].isdigit():
             prefix = first.split(".")[0] + "."
             sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
 
-        # vae_device() rather than get_torch_device() so --cpu-vae and friends are honoured.
-        # On the CPU this is ~1.3 s per full-resolution frame, so that is the user's call.
-        self.device = device if device is not None else comfy.model_management.vae_device()
-        self.dtype = dtype if dtype is not None else comfy.model_management.vae_dtype(
-            self.device, [torch.float16, torch.bfloat16])
-        self.model = build_tae_decoder(sd)
-        self.model.load_state_dict(sd)
-        self.model.eval().to(device=self.device, dtype=self.dtype)
+        resolved_device = _resolve_tae_device(device)
+        resolved_dtype = _resolve_tae_dtype(dtype, resolved_device)
+        try:
+            skip_upscale_layers = int(skip_upscale_layers)
+        except (TypeError, ValueError, OverflowError):
+            skip_upscale_layers = 0
+        skip_upscale_layers = max(0, skip_upscale_layers)
+
+        self.device = resolved_device
+        self.dtype = resolved_dtype
+        self.compile = bool(compile)
+        model = build_tae_decoder(sd)
+        model.load_state_dict(sd)
+        if skip_upscale_layers > 0:
+            modules = list(model)
+            up_idx = [i for i, m in enumerate(modules) if isinstance(m, nn.Upsample)]
+            skip_upscale_layers = min(skip_upscale_layers, len(up_idx))
+            if skip_upscale_layers > 0:
+                drop = set(up_idx[-skip_upscale_layers:])
+                model = nn.Sequential(*[m for i, m in enumerate(modules) if i not in drop])
+        self.skip_upscale_layers = skip_upscale_layers
+        model.eval().to(device=self.device, dtype=self.dtype)
+        if self.compile:
+            try:
+                model = torch.compile(model)
+            except Exception as e:
+                logging.warning(
+                    "[MiniMaxH3Preview] torch.compile failed (%s); using eager mode.",
+                    e,
+                )
+                self.compile = False
+        self.model = model
         for p in self.model.parameters():
             p.requires_grad_(False)
 
@@ -117,7 +187,7 @@ class TinyVaeDecoder:
         return torch.stack(frames, dim=0)
 
 
-def load_tae_decoder(name, device=None, dtype=None):
+def load_tae_decoder(name, device="auto", dtype="auto", compile=False, skip_upscale_layers=0):
     """Load by vae_approx filename. Returns None (and logs) if it cannot be used."""
     if not name or name == NONE:
         return None
@@ -130,7 +200,10 @@ def load_tae_decoder(name, device=None, dtype=None):
         return None
     try:
         sd = comfy.utils.load_torch_file(path, safe_load=True)
-        tae = TinyVaeDecoder(sd, device=device, dtype=dtype)
+        tae = TinyVaeDecoder(
+            sd, device=device, dtype=dtype, compile=compile,
+            skip_upscale_layers=skip_upscale_layers,
+        )
     except Exception as e:
         logging.warning(
             f"[MiniMaxH3Preview] could not load tiny VAE '{name}' ({e}); "
@@ -138,7 +211,9 @@ def load_tae_decoder(name, device=None, dtype=None):
         )
         return None
     logging.info(
-        "[MiniMaxH3Preview] tiny VAE '%s' loaded: %d latent channels, %dx upscale, on %s/%s",
+        "[MiniMaxH3Preview] tiny VAE '%s' loaded: %d latent channels, %dx upscale, on %s/%s%s%s",
         name, tae.latent_channels, tae.upscale_ratio, tae.device, tae.dtype,
+        " compiled" if tae.compile else "",
+        f" skip_upscale={tae.skip_upscale_layers}" if tae.skip_upscale_layers else "",
     )
     return tae

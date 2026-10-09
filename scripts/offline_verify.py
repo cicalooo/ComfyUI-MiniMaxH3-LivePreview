@@ -40,7 +40,7 @@ def test_imports_and_schema():
     pkg = importlib.import_module("ComfyUI-MiniMaxH3-LivePreview.preview")
     schema = pkg.MiniMaxH3LivePreview.define_schema()
     assert schema.node_id == "MiniMaxH3LivePreview"
-    assert len(schema.inputs) == 14
+    assert len(schema.inputs) == 20
     assert len(schema.outputs) == 1
     _ok("import + V3 schema")
     return pkg
@@ -74,6 +74,32 @@ def test_bounds(pkg):
     assert wrapper.vae_frames == 16
     assert wrapper.vae_device == "auto"
     assert wrapper.verbose is True
+    assert wrapper.throttle_secs == 0.0
+    assert wrapper.tae_device == "auto"
+    assert wrapper.tae_dtype == "auto"
+    assert wrapper.tae_compile is False
+    assert wrapper.skip_upscale_layers == 0
+    assert wrapper.tae_oom_retry is True
+    wrapper2 = pkg._H3PreviewWrapper(
+        node_id="1",
+        preview_frames=8,
+        preview_fps=24,
+        max_resolution=512,
+        every_n_steps=1,
+        upscale_method="bogus",
+        jpeg_quality=80,
+        suppress_default=True,
+        throttle_secs=999.0,
+        tae_device="bogus",
+        tae_dtype="bogus",
+        skip_upscale_layers=99,
+    )
+    assert wrapper2.throttle_secs == 60.0
+    assert wrapper2.tae_device == "auto"
+    assert wrapper2.tae_dtype == "auto"
+    assert wrapper2.skip_upscale_layers == 4
+    assert pkg._bounded_float("nope", 1.5, 0.0, 60.0) == 1.5
+    assert pkg._bounded_float(-3.0, 1.5, 0.0, 60.0) == 0.0
     _ok("legacy input bounds")
 
 
@@ -275,6 +301,113 @@ def test_step_timing(pkg):
     assert abs(step_ms - 500.0) < 1e-6
     assert abs(avg_ms - 375.0) < 1e-6
     _ok("sampler timing is independent of preview throttling")
+
+
+def test_lazy_nvenc(pkg):
+    assert isinstance(pkg._nvenc_available(), bool)
+    assert pkg._nvenc_available() is pkg._nvenc_available()
+    # Legacy import-time flag still resolves to the same probed value.
+    assert pkg._NVENC_AVAILABLE is pkg._nvenc_available()
+    _ok("lazy NVENC probe")
+
+
+def test_route_registration_retry(pkg):
+    old = pkg.PromptServer
+    pkg.PromptServer = None
+    try:
+        assert pkg._register_preview_media_routes() is False
+    finally:
+        pkg.PromptServer = old
+
+    class FakeRoutes:
+        def __init__(self):
+            self.handlers = {}
+
+        def _register(self, method, path):
+            def decorator(handler):
+                self.handlers[(method, path)] = handler
+                return handler
+            return decorator
+
+        def post(self, path):
+            return self._register("POST", path)
+
+        def get(self, path):
+            return self._register("GET", path)
+
+        def delete(self, path):
+            return self._register("DELETE", path)
+
+    class FakeServer:
+        def __init__(self):
+            self.routes = FakeRoutes()
+
+    class FakePromptServer:
+        instance = FakeServer()
+
+    pkg.PromptServer = FakePromptServer
+    try:
+        assert pkg._register_preview_media_routes() is True
+        count = len(FakePromptServer.instance.routes.handlers)
+        assert count == 3, count
+        # Second call is a no-op: no duplicate route handlers.
+        assert pkg._register_preview_media_routes() is True
+        assert len(FakePromptServer.instance.routes.handlers) == count
+    finally:
+        pkg.PromptServer = old
+    _ok("media routes retry until the server exists")
+
+
+def test_rgb_matrices_cache(pkg):
+    import comfy.latent_formats
+
+    lf = comfy.latent_formats.MiniMaxH3Video()
+    f1, b1 = pkg._rgb_matrices(lf, torch.device("cpu"), torch.float32)
+    f2, b2 = pkg._rgb_matrices(lf, torch.device("cpu"), torch.float32)
+    assert torch.equal(f1, f2)
+    assert (b1 is None) == (b2 is None)
+    if b1 is not None:
+        assert torch.equal(b1, b2)
+    assert len(pkg._RGB_MATRICES_CACHE) >= 1
+    try:
+        pkg._rgb_matrices(object(), torch.device("cpu"), torch.float32)
+    except ValueError as err:
+        assert "latent_rgb_factors" in str(err)
+    else:
+        raise AssertionError("missing latent_rgb_factors must remain observable")
+    _ok("latent2rgb projection cache")
+
+
+def test_collect_preview_targets(pkg):
+    import latent_preview
+
+    targets = pkg._collect_preview_targets()
+    assert latent_preview.LatentPreviewer in targets
+    assert len(targets) >= 1
+    _ok("previewer targets collected once per run")
+
+
+def test_worker_latest_drains_all(pkg):
+    started = threading.Event()
+    release = threading.Event()
+    executed = []
+
+    def blocker():
+        started.set()
+        release.wait(timeout=5)
+        executed.append("active")
+
+    worker = pkg._Worker("mmh3_verify_drain", maxsize=2)
+    assert worker.submit(blocker) is True
+    assert started.wait(timeout=2)
+    assert worker.submit(lambda: executed.append("old1")) is True
+    assert worker.submit(lambda: executed.append("old2")) is True
+    assert worker.submit_latest(lambda: executed.append("new")) is True
+    release.set()
+    worker.shutdown(drain_timeout=2, drain=True)
+    worker.thread.join(timeout=2)
+    assert executed == ["active", "new"], executed
+    _ok("latest preview job drains all stale queued work")
 
 
 def test_encode_paths(pkg):
@@ -556,6 +689,54 @@ def test_cpu_vae_process_output_contract(pkg):
     _ok("CPU VAE uses process_output contract")
 
 
+def test_tae_options(pkg):
+    tiny = importlib.import_module("ComfyUI-MiniMaxH3-LivePreview.tiny_vae")
+    # skip_upscale_layers pops trailing 2x stages: 16x -> 8x -> 4x
+    tae_full = tiny.load_tae_decoder("taeh3.safetensors")
+    assert tae_full is not None
+    assert tae_full.upscale_ratio == 16
+    tae_skip1 = tiny.load_tae_decoder("taeh3.safetensors", skip_upscale_layers=1)
+    assert tae_skip1 is not None
+    assert tae_skip1.upscale_ratio == 8, tae_skip1.upscale_ratio
+    tae_skip2 = tiny.load_tae_decoder("taeh3.safetensors", skip_upscale_layers=2)
+    assert tae_skip2.upscale_ratio == 4, tae_skip2.upscale_ratio
+    # over-skip clamps to the 4 available stages, never below 1x
+    tae_skip99 = tiny.load_tae_decoder("taeh3.safetensors", skip_upscale_layers=99)
+    assert tae_skip99.upscale_ratio == 1, tae_skip99.upscale_ratio
+    # explicit device/dtype resolve without raising
+    tae_cpu = tiny.load_tae_decoder("taeh3.safetensors", device="cpu", dtype="float32")
+    assert tae_cpu is not None
+    assert tae_cpu.device.type == "cpu" and tae_cpu.dtype == torch.float32
+    try:
+        tiny.load_tae_decoder("taeh3.safetensors", device="bogus")
+    except ValueError:
+        pass
+    else:
+        # load_tae_decoder logs-and-None on failure rather than raising
+        assert tiny.load_tae_decoder("taeh3.safetensors", device="bogus") is None
+    # decode at reduced upscale still yields valid frames
+    video = torch.randn(1, 24, 2, 6, 10, dtype=torch.float32)
+    frames, idx = pkg._tae_to_pil(video, tae_skip1, max_frames=2)
+    assert len(frames) == 2 and frames[0].size == (80, 48)
+    _ok("tae device/dtype/skip_upscale")
+
+
+def test_oom_semantics(pkg):
+    assert pkg._is_oom(torch.cuda.OutOfMemoryError("out of memory")) is True
+    assert pkg._is_oom(RuntimeError("CUDA out of memory. Tried to allocate")) is True
+    assert pkg._is_oom(ValueError("bad shape")) is False
+    _ok("oom detection")
+
+
+def test_bleh_conflict_check(pkg):
+    # Never raises, returns a bool; with the repo's blehconfig blacklisting H3
+    # it must report no conflict.
+    result = pkg._check_bleh_conflict()
+    assert isinstance(result, bool)
+    assert result is False, "expected no bleh conflict with H3 blacklisted"
+    _ok("bleh conflict check")
+
+
 def test_js_syntax():
     js = ROOT / "web" / "js" / "mmh3_preview.js"
     subprocess.run(["node", "--check", str(js)], check=True)
@@ -581,7 +762,12 @@ def main():
         test_worker_shutdown_when_full(pkg)
         test_worker_close_hook_after_inflight(pkg)
         test_worker_latest_wins(pkg)
+        test_worker_latest_drains_all(pkg)
         test_step_timing(pkg)
+        test_lazy_nvenc(pkg)
+        test_route_registration_retry(pkg)
+        test_rgb_matrices_cache(pkg)
+        test_collect_preview_targets(pkg)
         test_encode_paths(pkg)
         test_content_fps_scaling(pkg)
         test_pixel_budget(pkg)
@@ -590,6 +776,9 @@ def main():
         test_non_h3_status_event(pkg)
         test_cpu_vae_process_output_contract(pkg)
         test_latent2rgb_and_tae(pkg)
+        test_tae_options(pkg)
+        test_oom_semantics(pkg)
+        test_bleh_conflict_check(pkg)
         test_js_syntax()
     except Exception as err:
         print(f"FAIL  {err}")

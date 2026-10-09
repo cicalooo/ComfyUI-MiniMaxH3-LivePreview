@@ -308,6 +308,41 @@ run/generation rejection, object-URL cleanup, and DOM-widget layout bounds. Live
 for both TAE and latent streams were verified end-to-end. A purely visual click-through in the UI
 is optional and not required to close this hardening pass.
 
+## Overhaul pass (Oct 2026)
+
+Follow-up overhaul on top of the accepted hardening, preserving the node schema
+(14 inputs, same ids/defaults) and the websocket event fields:
+
+- **Lazy NVENC probe:** importing `av` moved from module import to the first
+  multi-frame encode (`_nvenc_available()`, probed once under a lock). ComfyUI
+  startup no longer pays the import for still/WebP-only users. The old
+  `_NVENC_AVAILABLE` name still resolves via module `__getattr__`.
+- **Media-route retry:** `_register_preview_media_routes()` is now idempotent,
+  lock-protected, returns whether the routes exist, and is retried on every
+  sampling run -- the import-time call can run before `PromptServer.instance`
+  exists, which previously left the same-origin MP4 fallback permanently
+  unregistered.
+- **Per-step caches:** latent2rgb projection matrices are cached per
+  latent-format constants (`_rgb_matrices`); stock-preview target classes are
+  collected once per run (`_collect_preview_targets`) instead of on every
+  sampler step.
+- **`submit_latest` drains all** stale pending jobs, not just one.
+- **Schema UX:** transport tuning (`upscale_method`, `jpeg_quality`), the
+  full-VAE trio plus `vae`, and `verbose` are now `advanced` (collapsed);
+  seven core widgets stay visible. `jpeg_quality` tooltip now states it covers
+  JPEG stills and the WebP fallback (NVENC MP4 uses its own rate control).
+- **Packaging:** added `pyproject.toml` (`Pillow` dependency, optional `av`
+  extra for MP4, `[tool.comfy]` display name). README now lists PyAV as
+  optional (WebP fallback) instead of required.
+- **Verification:** `scripts/offline_verify.py` gains lazy-NVENC, route-retry,
+  RGB-cache, target-collection, and drain-all checks. All prior checks still
+  pass unmodified, including the exact `ValueError` contract for missing
+  `latent_rgb_factors`.
+
+No frontend changes: the panel (serialized/coalesced media updates, run
+isolation, playback controls) needed none for this pass, and churning it would
+risk regressions for no functional gain.
+
 ## Final status
 
 Plugin-side hardening for the supported live-preview paths is complete, offline-verified, and

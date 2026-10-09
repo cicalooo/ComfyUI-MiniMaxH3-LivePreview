@@ -1,6 +1,6 @@
 # ComfyUI-MiniMaxH3-LivePreview
 
-A single MODEL-patch node — **MiniMax H3 Live Preview** — that shows the video building up on its own node body while H3 samples. Drop it between the H3 model loader and the sampler; nothing else to wire.
+One MODEL-patch node — **MiniMax H3 Live Preview** — that shows the video building on its own panel while H3 samples. Drop it between the H3 loader and the sampler; nothing else to wire.
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/204251b5-6327-4ced-a060-528aff4f40a6" alt="MiniMax H3 Live Preview on the node body" width="720">
@@ -8,8 +8,7 @@ A single MODEL-patch node — **MiniMax H3 Live Preview** — that shows the vid
 
 ```
 Load Diffusion Model ──▶ MiniMax H3 Live Preview ──▶ (Sol-Attn / Sigma Shift / …) ──▶ KSampler
-                                  │
-                                  └── preview panel updates every step
+                                   └── panel updates every step
 ```
 
 ## Install
@@ -17,118 +16,72 @@ Load Diffusion Model ──▶ MiniMax H3 Live Preview ──▶ (Sol-Attn / Sig
 1. Clone into `ComfyUI/custom_nodes/ComfyUI-MiniMaxH3-LivePreview`
 2. Restart ComfyUI
 3. Download [`taeh3.safetensors`](https://huggingface.co/Kijai/MiniMax-H3-TAE) into `ComfyUI/models/vae_approx/`
-4. Drop **MiniMax H3 Live Preview** between the H3 model loader and the sampler, then select `taeh3.safetensors`
+4. Insert the node between loader and sampler, select `taeh3.safetensors`
 
-Requires ComfyUI with MiniMax H3 support (`comfy/ldm/minimax/`), Pillow, and PyAV. Tested against `comfyui-frontend-package==1.51.9` on Windows / RTX 3090.
+Requires ComfyUI with H3 support (`comfy/ldm/minimax/`) + Pillow. PyAV is optional: with NVENC you get H.264, without it animated WebP. Tested on `comfyui-frontend-package==1.51.9`, Windows / RTX 3090.
 
-## What you see
+## Sources
 
-Pick a source with `tae_decoder`:
+- `none` (default) — latent2rgb, no VRAM, latent resolution (`1344×768` → `84×48`).
+- `taeh3.safetensors` — tiny 2D VAE (~10 MB), full resolution, ~0.25 s / 8 frames at 1344×768 fp16 on a 3090, ~640 MB peak. **Recommended.** Do not use `VAELoader` for it — core reports `VAE is invalid: None`.
 
-- **`none`** (default) — latent2rgb (`MiniMaxH3Video.latent_rgb_factors`): a single matmul, no VAE, no VRAM, latent resolution.
-- **`taeh3.safetensors`** — tiny 2D VAE (~10 MB), full resolution, cheap enough to run every step. **Recommended.**
-
-Download `vae_approx/taeh3.safetensors` into **`ComfyUI/models/vae_approx/`**. Do **not** load it with `VAELoader` — core ComfyUI does not recognise this checkpoint.
-
-Being 2D, it decodes each latent frame independently (the 4× temporal compression is not undone). Measured on a 3090 at 1344 × 768, fp16: **8 frames in 0.25 s, ~640 MB peak VRAM**. If a decode raises (OOM being the plausible one) the node logs once and falls back to latent2rgb for the rest of that run.
-
-A latent2rgb preview is inherently at **latent resolution** (`1344 × 768` → `84 × 48`). `max_resolution` upscales that for display (`nearest-exact` by default). `preview_frames` samples evenly across the clip, so you see the whole video, not just the first frame.
+Failed TAE decodes fall back to latent2rgb (OOM retries next step by default, see `tae_oom_retry`).
 
 ## Options
 
-| input | default | what it does |
+Core widgets stay visible; the rest are collapsed as advanced.
+
+| input | default | notes |
 |---|---|---|
-| `preview_frames` | 8 | latent frames per preview. `1` = a still JPEG; `>1` = animated |
-| `preview_fps` | 24 | content-timeline rate. H3 is authored at 24 fps, so `24` = realtime, `12` = half-speed |
-| `max_resolution` | 512 | longest side of the transmitted preview; `0` = native latent size |
-| `every_n_steps` | 1 | throttle. The final step always emits |
-| `upscale_method` | `nearest-exact` | `nearest-exact` / `lanczos` / `bilinear` |
-| `jpeg_quality` | 80 | transport quality |
-| `suppress_default_preview` | true | stop the sampler node rendering its own preview too |
-| `tae_decoder` | `none` | tiny VAE from `models/vae_approx` — `taeh3.safetensors` replaces latent2rgb |
-| `verbose` | false | include correlated preview failure details in the ComfyUI log and browser console |
+| `preview_frames` | 8 | frames per preview; `1` = JPEG still, `>1` = animated |
+| `preview_fps` | 24 | timeline rate; `24` = realtime, `12` = half-speed |
+| `max_resolution` | 512 | longest side; `0` = native |
+| `every_n_steps` | 1 | image throttle; final step always emits |
+| `throttle_secs` | 0.0 | min seconds between decodes; progress/ETA still update every step |
+| `tae_decoder` | `none` | tiny VAE from `vae_approx`; `taeh3.safetensors` = full-res |
+| `tae_device` | `auto` | `auto` (honours `--cpu-vae`) / `gpu` / `cpu` |
+| `tae_dtype` | `auto` | `auto` (fp16/bf16) / `float32` / `float16` / `bfloat16` |
+| `tae_compile` | false | `torch.compile` the TAE; slower first preview, faster steps |
+| `skip_upscale_layers` | 0 | skip N trailing 2x TAE stages (16x→8x→4x→2x→1x) |
+| `tae_oom_retry` | true | OOM = latent2rgb for that step, retry next; off = disable TAE for run |
+| `suppress_default_preview` | true | hide the sampler node's own preview |
+| `upscale_method` | `nearest-exact` | + `lanczos` / `bilinear` |
+| `jpeg_quality` | 80 | JPEG stills + WebP fallback (NVENC uses its own rate control) |
+| `vae` / `vae_decode_every_n_steps` / `vae_decode_frames` / `vae_decode_device` | — / 0 / 1 / `auto` | full 5.2 GB video VAE; niche, leave off (see below) |
+| `verbose` | false | detailed failure traces in log + console |
 
-`every_n_steps` throttles image work only; the sampler progress bar, step timing, and ETA continue to update on every callback.
+Hover/focus the panel for play/pause, scrubber, elapsed/total. Playhead survives updates; playback pauses at run end, click to replay. Non-H3 models pass through with one warning.
 
-Animated previews are sent as H.264 via NVENC when PyAV exposes it, and as animated WebP otherwise. If a browser policy rejects the temporary `blob:` video URL, the widget automatically retries that MP4 through a short-lived same-origin URL. Hover or focus the panel for play/pause, the scrubber, and elapsed/total time. The playhead is retained when a newer preview arrives. Playback pauses when execution finishes; click the panel to replay it.
-
-Attaching the node to a non-H3 model is safe: it logs one warning and passes sampling through untouched.
+If ComfyUI-bleh is installed, blacklist H3 (`minimaxh3video`/`minimaxh3av` in `previews.blacklist_formats`) or bleh crashes on this file (`KeyError: 'decoder.7.conv.weight'`); this node warns on conflict.
 
 <details>
-<summary>Why this exists instead of KJNodes' Model Preview Override</summary>
+<summary>Why not KJNodes' Model Preview Override</summary>
 
-KJNodes' generic node attaches to H3 without complaint and then emits **nothing**. H3 is unusual in two ways that break every generic preview path:
-
-- Its latents are a `NestedTensor(video [B,24,T,H/16,W/16], audio [B,32,2,Ta])`. `NestedTensor` has no `detach`/`movedim`, reports `ndim` as the max over its streams, and forwards `__getitem__` to *both* streams — so `Latent2RGBPreviewer`'s `x0[0, :, 0]` slices the audio tensor as if it were video, and the vectorised paths raise `AttributeError` into a swallowing `except`.
-- Inside an `OUTER_SAMPLE` wrapper the callback receives the **flat packed** `[B, 1, N]` tensor, not the nested view — the nesting callback is installed further out, in `comfy/samplers.py`. The correct split is `comfy.utils.unpack_latents(x0, latent_shapes)`.
-
-This node handles both, keeps the video stream and discards the audio stream.
-
+H3 latents are `NestedTensor(video [B,24,T,H/16,W/16], audio [B,32,2,Ta])` with no `detach`/`movedim`, and inside `OUTER_SAMPLE` the callback gets flat packed `[B,1,N]`. Generic paths slice the audio stream as video or raise into a swallowed `except`. This node splits via `comfy.utils.unpack_latents` and keeps video only.
 </details>
 
 <details>
-<summary>Why taeh3 cannot be loaded with VAELoader</summary>
+<summary>Why VAELoader / bleh can't load taeh3</summary>
 
-It fails with `WARNING: No VAE weights detected, VAE not initalized.` followed by `RuntimeError: ERROR: VAE is invalid: None`. Core ComfyUI recognises TAE checkpoints only by `taesd_decoder.1.weight` (2D TAESD) or `decoder.22.bias` (TAEHV); taeh3 is a *bare* decoder keyed by plain module indices. And even with the prefix fixed, `comfy.taesd.taesd.Decoder` hardcodes a 64-wide stack with three upsample stages, while taeh3 is 24 latent channels, 96 wide for its first half, and four upsample stages (H3's VAE is 16× spatial, not 8×). `tiny_vae.py` in this repo rebuilds the architecture from the checkpoint's own keys instead.
-
+Core recognises TAEs only by `taesd_decoder.1.weight` or `decoder.22.bias`; taeh3 is a bare index-keyed decoder (24 ch, 96-wide, 4 upsample stages for 16×). `tiny_vae.py` rebuilds the arch from the keys. Bleh expects madebyollin `taeh3.pth` (`decoder.*` + `TGrow`), hence the blacklist above.
 </details>
 
 <details>
-<summary>Full H3 video VAE (niche, leave off)</summary>
+<summary>Full video VAE (niche, leave off)</summary>
 
-**Supported full-resolution previews use `taeh3`.** The real video-VAE option is mainly for very-high-VRAM cards. Most users should leave `vae_decode_every_n_steps` at `0`.
-
-| input | default | what it does |
-|---|---|---|
-| `vae` | — | optional H3 **video** VAE, for true full-resolution frames |
-| `vae_decode_every_n_steps` | 0 | `0` = off |
-| `vae_decode_frames` | 1 | full-res frames per VAE preview |
-| `vae_decode_device` | `auto` | `auto` / `gpu` / `cpu` |
-
-The H3 video VAE is **~5.2 GB**. An H3 transformer is **~21 GB**. On a 24 GB card they do not co-fit:
-
-- **`gpu`** — ComfyUI evicts the transformer to make room for the VAE and reloads it from disk afterwards, around *every* preview. Runs **synchronously on the sampler thread**. Expect sampling to visibly stall.
-- **`cpu`** — pins `first_stage_model` to CPU/fp32, decodes off-thread. Sampling is not stalled, but a frame takes minutes. If a decode is still running when the next is due, it is dropped.
-- **`auto`** — compares live free VRAM against the VAE's weights plus decode activations. On a 24 GB card running H3 it will pick `cpu`.
-
-Cheap previews keep flowing while a VAE decode runs. The node's header has `latent` / `tae` / `vae` tabs; the panel switches to the truer stream the first time one lands, then leaves the choice to you.
-
+`vae_decode_every_n_steps=0` = off. The ~5.2 GB VAE + ~21 GB transformer don't co-fit on 24 GB: `gpu` evicts/reloads the transformer around every preview (synchronous stall), `cpu` pins to CPU/fp32 off-thread (minutes/frame, drops when behind), `auto` picks from live free VRAM. `latent` / `tae` / `vae` tabs switch to the truer stream on first VAE frame.
 </details>
 
 <details>
 <summary>Verification</summary>
 
-Offline hardening checks (no live server required), from the ComfyUI root:
+From the ComfyUI root (use ComfyUI's interpreter):
 
 ```bat
 set PYTHONPATH=%CD%;%CD%\custom_nodes
 python custom_nodes\ComfyUI-MiniMaxH3-LivePreview\scripts\offline_verify.py
-```
-
-Use the same interpreter that launches ComfyUI; on the bundled Windows checkout this is usually `C:\comfycli\.venv\Scripts\python.exe` rather than the system `python`.
-
-Live TAE/latent websocket acceptance (ComfyUI must be running):
-
-```bat
 python custom_nodes\ComfyUI-MiniMaxH3-LivePreview\scripts\live_accept_preview.py
 ```
 
-Add `--verbose` when collecting a failure report; it enables correlated backend tracebacks and
-browser-console diagnostics for the preview node.
-
-Accepted scope is **TAE + latent2rgb**. Full video-VAE live preview is a niche optional path and not part of normal acceptance.
-
-</details>
-
-<details>
-<summary>Audit notes / remaining host limitations</summary>
-
-Hardening details are in [`docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md`](docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md). These items are intentionally **not** changed here because they belong to ComfyUI core or the separate H3 loader/VAE implementation:
-
-- **Core `NestedTensor` callback contract:** the sampler still packs AV latents and reconstructs the nested callback view in `comfy/samplers.py`. If that contract changes upstream, this node's `unpack_latents` integration must be re-checked.
-- **Core `PromptServer` routing:** events are sent to the current `PromptServer.client_id`. This plugin does not add a server route or broadcast previews.
-- **Full H3 video-VAE memory behavior:** the ~5.2 GiB VAE and transformer eviction/reload cost are properties of the connected VAE and ComfyUI model-management. This path is intentionally niche; `taeh3` is the supported full-resolution preview.
-- **PyAV/NVENC availability:** codec support is supplied by the installed PyAV wheel and NVIDIA driver. The node falls back to animated WebP.
-- **Frontend lifecycle/version compatibility:** the node uses the current `window.comfyAPI` extension API.
-
+Live acceptance scope is TAE + latent2rgb. Details: [`docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md`](docs/MINIMAX_H3_LIVE_PREVIEW_AUDIT.md).
 </details>

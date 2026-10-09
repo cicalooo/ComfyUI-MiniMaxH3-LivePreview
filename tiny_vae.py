@@ -149,6 +149,12 @@ class TinyVaeDecoder:
                 model = nn.Sequential(*[m for i, m in enumerate(modules) if i not in drop])
         self.skip_upscale_layers = skip_upscale_layers
         model.eval().to(device=self.device, dtype=self.dtype)
+        for p in model.parameters():
+            p.requires_grad_(False)
+        # Introspect before torch.compile: the compiled OptimizedModule
+        # is not subscriptable/iterable, so this must run on the Sequential.
+        self.latent_channels = model[1].weight.shape[1]
+        self.upscale_ratio = 2 ** sum(isinstance(m, nn.Upsample) for m in model)
         if self.compile:
             try:
                 model = torch.compile(model)
@@ -159,11 +165,6 @@ class TinyVaeDecoder:
                 )
                 self.compile = False
         self.model = model
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-
-        self.latent_channels = self.model[1].weight.shape[1]
-        self.upscale_ratio = 2 ** sum(isinstance(m, nn.Upsample) for m in self.model)
 
     def decode(self, latent):
         """[B, C, h, w] -> [B, 3, h*ratio, w*ratio], float32 on the caller's device."""
